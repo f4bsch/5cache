@@ -13,6 +13,17 @@ Copy this file to wp-content/object-cache.php
 Todo: expiry
 non_persistent_groups
 make plugins contidionally persistent
+Benchmark WP_Object_Cache_Shm with writeback disabled (compared to WP builtin)
+test 2D cache array for volatileCache
+carrier plugin
+
+these should be made persistent by lazy update (in some background task)
+Array
+(
+    [counts] => 1
+    [plugins] => 1
+    [themes] => 1
+)
 */
 
 class WP_Object_Cache_Shm {
@@ -458,11 +469,13 @@ function wp_cache_init() {
 
 	$wp_object_cache = new WP_Object_Cache_Shm();
 
+	/*
 	$wrapperFile = dirname( __FILE__ ) . '/object-cache-stats-wrapper.php';
 	if ( is_file( $wrapperFile ) ) {
 		include_once $wrapperFile;
 		$GLOBALS['wp_object_cache'] = new WP_Object_Cache_Stats_Wrapper( $GLOBALS['wp_object_cache'] );
 	}
+	*/
 }
 
 /**
