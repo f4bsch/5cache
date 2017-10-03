@@ -5,6 +5,7 @@ require_once 'object-cache.php';
 wp_cache_init();
 
 
+echo "<pre>";
 
 $i = wp_cache_get('i');
 if($i === false) {
@@ -43,3 +44,27 @@ if($i % 2) {
 	}
 	echo "ok! $num";
 }
+
+
+echo "\nexpiry test:\n";
+
+$expireAt = wp_cache_get('expire_at1');
+$expire = 4;
+
+if(!$expireAt) {
+	wp_cache_set('expire_at1', time()+$expire, '', $expire );
+
+	wp_cache_set('expire_in1', time()+1, '', 1 );
+	wp_cache_set('expire_in2', time()+2, '', 2 );
+	echo "set expire in $expire seconds";
+} else {
+	$s = $expireAt - time();
+	echo "$expireAt should expire in $s seconds (expiry is $expire)\n";
+
+	$expireIn1 = wp_cache_get('expire_in1');
+	echo "expireIn1: $expireIn1 \n";
+
+	$expireIn2 = wp_cache_get('expire_in2');
+	echo "expireIn2: $expireIn2 \n";
+}
+

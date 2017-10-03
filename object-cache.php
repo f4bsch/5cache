@@ -1,9 +1,9 @@
 <?php
 /*
 Plugin Name: 5cache
-Description: Two layer cache using System V shared memory
+Description: An ultra low latency cache with two layers using System V shared memory
 Version: 0.1.0
-Plugin URI: http://fabi.me/
+Plugin URI: http://calltr.ee/
 Author: Fabian Schlieper
 
 Copy this file to wp-content/object-cache.php
@@ -12,10 +12,13 @@ Copy this file to wp-content/object-cache.php
 /*
 Todo: expiry
 non_persistent_groups
-make plugins contidionally persistent
-Benchmark WP_Object_Cache_Shm with writeback disabled (compared to WP builtin)
+make plugins conditionally persistent
+Benchmark WP_Object_Cache_Shm with write back disabled (compared to WP builtin)
 test 2D cache array for volatileCache
 carrier plugin
+
+global groups are currently ignored!
+TODO triggers to flush non persistent groups (such as `plugins`)
 
 these should be made persistent by lazy update (in some background task)
 Array
@@ -32,12 +35,11 @@ class WP_Object_Cache_Shm {
 	private $multisite;
 	private $blog_id;
 
-	// stats must be public
+	// stats are public
 	public $cache_misses = 0;
 	public $cache_hits = 0;
 
-
-	public $global_groups = array( 'WP_Object_Cache_global' );
+	public $global_groups = array(); // TODO
 	public $non_persistent_groups = array();
 
 	private $shm = null;
@@ -45,7 +47,13 @@ class WP_Object_Cache_Shm {
 	private $volatileCache = array();
 	private $writeBackKeys = array();
 	private $missingKeys = array();
+	private $expiryTable = array();
 
+	private $expiryTableUpdated = false;
+
+	private $clock = 0;
+
+	private $doingPrime = false;
 
 	public function __construct() {
 		$this->multisite = function_exists( 'is_multisite' ) && is_multisite();
@@ -53,8 +61,24 @@ class WP_Object_Cache_Shm {
 
 		$this->open();
 
+		$this->clock = ( isset( $_SERVER['REQUEST_TIME'] ) ? $_SERVER['REQUEST_TIME'] : time() );
+
+		if ( isset( $_GET['5cache-prime'] ) ) {
+			$this->handlePrime();
+		}
+
+		// remove slow actions
+		add_action( 'plugins_loaded', function () {
+			is_admin()
+			&& remove_action( 'load-plugins.php', 'wp_update_plugins' )
+			&& remove_action( 'load-update-core.php', 'wp_update_plugins' )
+			&& remove_action( 'load-update-core.php', 'wp_update_themes' );
+		} );
+
 		register_shutdown_function( function () {
-			register_shutdown_function( array( $this, 'close' ) );
+			if(!$this->doingPrime)
+				$this->maybeSpawnPrimers();
+			register_shutdown_function( array( $this, 'close' ) ); // close very late
 		} );
 	}
 
@@ -68,13 +92,32 @@ class WP_Object_Cache_Shm {
 		if ( ! is_resource( $this->shm ) ) {
 			throw new \RuntimeException( 'shm_attach failed' );
 		}
+
+		$this->readExpiryTable();
 	}
 
 	public function close() {
+
 		// lazy write back before close
-		foreach ( $this->writeBackKeys as $gKey => $one ) {
-			shm_put_var( $this->shm, self::intHash( $gKey ), $this->volatileCache[ $gKey ] );
+		$writeOk = true;
+		foreach ( $this->writeBackKeys as $gKey => $expire ) {
+			$ki = self::intHash( $gKey );
+			if ( ! @shm_put_var( $this->shm, $ki, $this->volatileCache[ $gKey ] ) ) {
+				$data = $this->volatileCache[ $gKey ];
+				// assume fail is OOM, delete all other keys, sorry :/
+				$this->flush();
+				$writeOk &= shm_put_var( $this->shm, $ki, $data );
+			}
 		}
+
+		if ( $this->expiryTableUpdated ) {
+			$writeOk &= $this->writeExpiryTable();
+		}
+
+		if ( ! $writeOk ) {
+			error_log( '5cache: error during lazy write!' );
+		}
+
 		$this->writeBackKeys = array();
 
 		$ok        = shm_detach( $this->shm );
@@ -83,6 +126,136 @@ class WP_Object_Cache_Shm {
 		return $ok;
 	}
 
+	private function maybeSpawnPrimers() {
+		if ( function_exists( 'get_current_screen' ) && ( $screen = get_current_screen() ) ) {
+			$lastPrimeTimes = $this->get( 'lastPrimeTimes', '5cache' );
+			$spawned        = false;
+			foreach ( self::bgPrimers() as $gKey => $primer ) {
+				$interval = INF;
+				$scrs = $primer['admin_screens'];
+
+				// pick the smallest matching inverval
+				foreach ( [ '*', $screen->parent_base, $screen->id ] as $s ) {
+					if ( isset( $scrs[ $s ] ) && ( $scrs[ $s ] < $interval ) ) {
+						$interval = $scrs[ $s ];
+					}
+				}
+
+				if ( $interval === INF || ( isset( $lastPrimeTimes[ $gKey ] ) && ( $this->clock - $lastPrimeTimes[ $gKey ] ) < $interval ) ) {
+					continue;
+				}
+
+				self::spawnPrime( $gKey );
+
+				$lastPrimeTimes[ $gKey ] = $this->clock;
+				$spawned                 = true;
+			}
+
+			if ( $spawned ) {
+				$this->set( 'lastPrimeTimes', $lastPrimeTimes, '5cache' );
+			}
+		}
+	}
+
+	private static function spawnPrime( $gKey ) {
+		$pu = ( add_query_arg( array( '5cache-prime' => $gKey, '5n' => wp_create_nonce( "5cache-prime=$gKey" ) ) ) );
+		echo "<script>(function(){var x=new XMLHttpRequest();x.open('GET','$pu');x.send();})();</script>";
+	}
+
+	private function handlePrime() {
+		ignore_user_abort( true );
+
+		add_action( 'plugins_loaded', function () {
+			if ( ! function_exists( 'wp_verify_nonce' ) ) {
+				require_once( ABSPATH . WPINC . '/pluggable.php' );
+			}
+			$this->doingPrime = isset( $_GET['5n'] ) && wp_verify_nonce( $_GET['5n'], "5cache-prime=" . $_GET['5cache-prime'] );
+			if ( ! $this->doingPrime ) {
+				wp_die( 'invalid prime ' . $_GET['5n'] . ' ' . "5cache-prime=" . $_GET['5cache-prime'] );
+				exit;
+			}
+			register_shutdown_function( function () {
+				$this->doPrime( $_GET['5cache-prime'] );
+			} );
+		} );
+	}
+
+
+	/**
+	 * Primes a specific cache value
+	 *
+	 * @param $gKey
+	 *
+	 */
+	private function doPrime( $gKey ) {
+		$this->housekeeping();
+
+		$primers = self::bgPrimers();
+
+		if ( ! isset( $primers[ $gKey ] ) ) {
+			return;
+		}
+
+		list( $group, $key ) = explode( ':', $gKey );
+		wp_cache_delete( $key, $group );
+		$t = microtime( true );
+		call_user_func( $primers[ $gKey ]['func'] );
+
+		$t = round( ( microtime( true ) - $t ) * 1000 );
+
+		echo "<!-- 5cache primed $gKey in $t ms -->";
+	}
+
+	/**
+	 * These are the deferred cache primers.
+	 * '{group}:{key}' => ['admin_screens' => [ '{screen}' => {update_interval}, 'func' => {primer} ]
+	 *
+	 * 'admin_screens' defines on which admin screens the value should be refreshed with given interval
+	 * {primer} must call wp_cache_set({key}, ..., {group})
+	 *
+	 * @return array
+	 */
+	private static function bgPrimers() {
+		return array(
+			'plugins:plugins'               => array(
+				'admin_screens' => [ 'plugins' => 1, 'update-core' => 1 ],
+				'func'          => function () {
+					if ( ! function_exists( 'get_plugins' ) ) {
+						require_once( ABSPATH . 'wp-admin/includes/plugin.php' );
+					}
+					get_plugins();
+				}
+			),
+			'site-transient:update_plugins' => array(
+				'admin_screens' => [ '*' => 300, 'update-core' => 1 ],
+				'func'          => function () {
+					wp_update_plugins();
+				}
+			),
+
+			// for themes, there is wp_get_themes(), but it doesn't use the cache
+
+			'site-transient:update_themes' => array(
+				'admin_screens' => [ '*' => 300, 'update-core' => 1 ],
+				'func'          => function () {
+					wp_update_themes();
+				}
+			)
+		);
+	}
+
+	/**
+	 * Delete expired data from shared memory. Does not touch volatile cache layer
+	 */
+	private function housekeeping() {
+		foreach ( $this->expiryTable as $ki => $expireAt ) {
+			if ( $expireAt > $this->clock && shm_has_var( $this->shm, $ki ) ) {
+				shm_remove_var( $this->shm, $ki );
+				unset( $this->expiryTable [ $ki ] );
+				$this->expiryTableUpdated = true;
+			}
+		}
+	}
 
 	/**
 	 * @param string $key
@@ -100,8 +273,26 @@ class WP_Object_Cache_Shm {
 		}
 
 		$this->volatileCache[ $gKey ] = $data;
-		$this->writeBackKeys[ $gKey ] = 1;
+		$this->writeBackKeys[ $gKey ] = $expire;
 		unset( $this->missingKeys[ $gKey ] );
+
+
+		// if no expiry is set is in a non persistent group, set expire to a fixed value (5min)
+		if ( $expire <= 0 ) {
+			if ( isset( $this->non_persistent_groups[ $group ] ) ) {
+				$expire = 300;
+			}
+		}
+
+		// update expiryTable
+		$ki = self::intHash( $gKey );
+		if ( $expire > 0 ) {
+			$this->expiryTable[ $ki ] = $this->clock + $expire + 1;
+			$this->expiryTableUpdated = true;
+		} elseif ( isset( $this->expiryTable[ $ki ] ) ) {
+			unset( $this->expiryTable[ $ki ] );
+			$this->expiryTableUpdated = true;
+		}
 
 		return true;
 	}
@@ -125,10 +316,11 @@ class WP_Object_Cache_Shm {
 			$found = true;
 			++ $this->cache_hits;
 
-			if(is_object($this->volatileCache[ $gKey ]))
+			if ( is_object( $this->volatileCache[ $gKey ] ) ) {
 				return clone $this->volatileCache[ $gKey ];
-			else
+			} else {
 				return $this->volatileCache[ $gKey ];
+			}
 		}
 
 		if ( isset( $this->missingKeys[ $gKey ] ) ) {
@@ -138,7 +330,19 @@ class WP_Object_Cache_Shm {
 			return false;
 		}
 
-		$ki    = self::intHash( $gKey );
+		$ki = self::intHash( $gKey );
+
+		// check expiry
+		if ( isset( $this->expiryTable[ $ki ] ) && $this->expiryTable[ $ki ] < $this->clock ) {
+			$this->missingKeys[ $gKey ] = true;
+			unset( $this->volatileCache[ $gKey ], $this->expiryTable[ $ki ] );
+			$found = false;
+			++ $this->cache_misses;
+
+			return false;
+		}
+
+
 		$found = shm_has_var( $this->shm, $ki );
 		if ( ! $found ) {
 			$this->missingKeys[ $gKey ] = 1;
@@ -154,11 +358,33 @@ class WP_Object_Cache_Shm {
 		return $value;
 	}
 
+	private function readExpiryTable() {
+		$ki = self::intHash( '_expiry' );
+		if ( ! shm_has_var( $this->shm, $ki ) ) {
+			return;
+		}
+		$res                      = shm_get_var( $this->shm, $ki );
+		$this->expiryTable        = is_array( $res ) ? $res : array();
+		$this->expiryTableUpdated = false;
+	}
+
+	private function writeExpiryTable() {
+		$ki = self::intHash( '_expiry' );
+		if ( ! @shm_put_var( $this->shm, $ki, $this->expiryTable ) ) {
+			$this->flush(); // delete all data if we can't write expiry table
+
+			return false;
+		}
+		$this->expiryTableUpdated = false;
+
+		return true;
+	}
+
 
 	public function _delete(
 		$key, $group = 'default', /** @noinspection PhpUnusedParameterInspection */
 		$deprecated = false
-	) {
+	) {// echo "<!-- 5cache del $key -->";
 		$gKey = $this->gKey( $key, $group );
 
 		$ok = isset( $this->volatileCache[ $gKey ] );
@@ -171,6 +397,9 @@ class WP_Object_Cache_Shm {
 
 			return $ok;
 		}
+
+		unset( $this->expiryTable[ $ki ] );
+		$this->expiryTableUpdated = true;
 
 		return shm_remove_var( $this->shm, $ki ) || $ok;
 	}
@@ -239,7 +468,7 @@ class WP_Object_Cache_Shm {
 			$groups = (array) $groups;
 		}
 
-		$groups                = array_fill_keys( $groups, true );
+		$groups                      = array_fill_keys( $groups, true );
 		$this->non_persistent_groups = array_merge( $this->non_persistent_groups, $groups );
 	}
 
@@ -257,8 +486,11 @@ class WP_Object_Cache_Shm {
 	 * @return true Always returns true.
 	 */
 	public function flush() {
-		$this->volatileCache = array();
-		$this->writeBackKeys = array();
+		$this->volatileCache      = array();
+		$this->writeBackKeys      = array();
+		$this->expiryTable        = array();
+		$this->expiryTableUpdated = false;
+
 		shm_remove( $this->shm );
 		$this->close();
 		$this->open();
@@ -278,7 +510,15 @@ class WP_Object_Cache_Shm {
 			return false;
 		}
 
-		if ( shm_has_var( $this->shm, self::intHash( $gKey ) ) ) {
+		$ki = self::intHash( $gKey );
+		if ( isset( $this->expiryTable[ $ki ] ) && $this->expiryTable[ $ki ] < $this->clock ) {
+			$this->missingKeys[ $gKey ] = true;
+			unset( $this->volatileCache[ $gKey ], $this->expiryTable[ $ki ] );
+
+			return false;
+		}
+
+		if ( shm_has_var( $this->shm, $ki ) ) {
 			return true;
 		} else {
 			$this->missingKeys[ $gKey ] = true;
@@ -395,8 +635,7 @@ function wp_cache_decr( $key, $offset = 1, $group = '' ) {
 
 
 function wp_cache_close() {
-	global $wp_object_cache;
-	//$wp_object_cache->close();
+	// caches handles closing
 
 	return true;
 }
@@ -408,7 +647,7 @@ function wp_cache_close() {
  * @since 2.0.0
  *
  * @see WP_Object_Cache::delete()
- * @global WP_Object_Cache $wp_object_cache Object cache global instance.
+ * @global WP_Object_Cache_Shm $wp_object_cache Object cache global instance.
  *
  * @param int|string $key What the contents in the cache are called.
  * @param string $group Optional. Where the cache contents are grouped. Default empty.
@@ -463,19 +702,15 @@ function wp_cache_get( $key, $group = '', $force = false, &$found = null ) {
 	return $wp_object_cache->get( $key, $group, $force, $found );
 }
 
+/**
+ * @global WP_Object_Cache_Shm $wp_object_cache
+ */
+global $wp_object_cache;
 
 function wp_cache_init() {
 	global $wp_object_cache;
 
 	$wp_object_cache = new WP_Object_Cache_Shm();
-
-	/*
-	$wrapperFile = dirname( __FILE__ ) . '/object-cache-stats-wrapper.php';
-	if ( is_file( $wrapperFile ) ) {
-		include_once $wrapperFile;
-		$GLOBALS['wp_object_cache'] = new WP_Object_Cache_Stats_Wrapper( $GLOBALS['wp_object_cache'] );
-	}
-	*/
 }
 
 /**
