@@ -76,8 +76,9 @@ class WP_Object_Cache_Shm {
 		} );
 
 		register_shutdown_function( function () {
-			if(!$this->doingPrime)
+			if ( ! $this->doingPrime ) {
 				$this->maybeSpawnPrimers();
+			}
 			register_shutdown_function( array( $this, 'close' ) ); // close very late
 		} );
 	}
@@ -132,7 +133,7 @@ class WP_Object_Cache_Shm {
 			$spawned        = false;
 			foreach ( self::bgPrimers() as $gKey => $primer ) {
 				$interval = INF;
-				$scrs = $primer['admin_screens'];
+				$scrs     = $primer['admin_screens'];
 
 				// pick the smallest matching inverval
 				foreach ( [ '*', $screen->parent_base, $screen->id ] as $s ) {
@@ -220,9 +221,7 @@ class WP_Object_Cache_Shm {
 			'plugins:plugins'               => array(
 				'admin_screens' => [ 'plugins' => 1, 'update-core' => 1 ],
 				'func'          => function () {
-					if ( ! function_exists( 'get_plugins' ) ) {
-						require_once( ABSPATH . 'wp-admin/includes/plugin.php' );
-					}
+					! function_exists( 'get_plugins' ) && require_once( ABSPATH . 'wp-admin/includes/plugin.php' );
 					get_plugins();
 				}
 			),
@@ -230,6 +229,10 @@ class WP_Object_Cache_Shm {
 				'admin_screens' => [ '*' => 300, 'update-core' => 1 ],
 				'func'          => function () {
 					wp_update_plugins();
+
+					// ... prime poptags
+					! function_exists( 'install_popular_tags' ) && require_once( ABSPATH . 'wp-admin/includes/plugin-install.php' );
+					install_popular_tags();
 				}
 			),
 
@@ -351,7 +354,18 @@ class WP_Object_Cache_Shm {
 			return false;
 		}
 
-		$value                        = shm_get_var( $this->shm, $ki );
+		$value = shm_get_var( $this->shm, $ki );
+
+		// TODO: shm_get_var sometimes returns NULL
+		// should log this, needs investigation
+		if ( is_null( $value ) ) {
+			shm_remove_var( $this->shm, $ki );
+			$this->missingKeys[ $gKey ] = 1;
+			++ $this->cache_misses;
+
+			return false;
+		}
+
 		$this->volatileCache[ $gKey ] = $value;
 		++ $this->cache_hits;
 
