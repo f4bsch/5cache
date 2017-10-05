@@ -1,22 +1,27 @@
 <?php
 
+require_once 'test-lib.php';
 require_once 'object-cache.php';
 
 wp_cache_init();
 
 
-echo "<pre>";
-
-$i = wp_cache_get('i');
+$found = 123;
+$i = wp_cache_get('i', '', false, $found);
 if($i === false) {
+	testAssert($found === false);
 	if(!wp_cache_add('i', 0))
 		die('add failed!');
 	echo "first cache access, reload the page!\n";
 	exit;
 }
 
+testAssert($found === true);
+
 echo "cach acccess i=$i\n";
-$i = wp_cache_incr('i');
+$i2 = wp_cache_incr('i');
+testAssert(($i+1) === $i2);
+$i = $i2;
 
 $num = ftok(__FILE__, 'a') * round($i/2);
 $testData = [

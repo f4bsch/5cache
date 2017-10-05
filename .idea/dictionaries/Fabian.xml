@@ -5,8 +5,13 @@
       <w>doesn</w>
       <w>fivecache</w>
       <w>inverval</w>
+      <w>ipcclean</w>
+      <w>ipcrm</w>
+      <w>ipcs</w>
       <w>poptags</w>
       <w>scrs</w>
+      <w>segv</w>
+      <w>shmid</w>
       <w>storable</w>
     </words>
   </dictionary>
