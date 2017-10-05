@@ -3,34 +3,33 @@
 Plugin Name: 5cache
 Description: An ultra low latency cache with two layers using System V shared memory
 Version: 0.1.0
-Plugin URI: http://calltr.ee/
+Plugin URI: http://calltr.ee/5cache
 Author: Fabian Schlieper
 
 Copy this file to wp-content/object-cache.php
 */
 
 /*
-Todo: expiry
-non_persistent_groups
-make plugins conditionally persistent
-Benchmark WP_Object_Cache_Shm with write back disabled (compared to WP builtin)
-test 2D cache array for volatileCache
 carrier plugin
-
-global groups are currently ignored!
-TODO triggers to flush non persistent groups (such as `plugins`)
-
-these should be made persistent by lazy update (in some background task)
-Array
-(
-    [counts] => 1
-    [plugins] => 1
-    [themes] => 1
+usually persistent cache groups: [counts,plugins,themes]
 )
+
+// TODO
+* featured image set was not working
+ * allow wp_cache_add to overwrite!
+ * store expiryTable with semaphore!
+ * NEED to remap false and NULL, because shm_read can return false/NULL!!!
+ *
+ *
+ * catch:
+ * cache/site-transient/browser_a9db4d03969fdd98d377b682b063efe6	 355.14 ms	wpc0re/wp_dashboard_setup	     1
 */
+
+defined('FIVECACHE_DRY_RUN') || define('FIVECACHE_DRY_RUN', false);
 
 class WP_Object_Cache_Shm {
 	const MAX_CACHE_SIZE = 1024 * 1024 * 4;
+	const EXPIRE_DELAY = 0;
 
 	private $multisite;
 	private $blog_id;
@@ -55,25 +54,45 @@ class WP_Object_Cache_Shm {
 
 	private $doingPrime = false;
 
+
 	public function __construct() {
+		//echo __FUNCTION__.":".__LINE__."<br>\n";
 		$this->multisite = function_exists( 'is_multisite' ) && is_multisite();
 		$this->blog_id   = $this->multisite ? ( 1 + get_current_blog_id() ) : 0;
+
 
 		$this->open();
 
 		$this->clock = ( isset( $_SERVER['REQUEST_TIME'] ) ? $_SERVER['REQUEST_TIME'] : time() );
 
 		if ( isset( $_GET['5cache-prime'] ) ) {
+			// Background Primer
 			$this->handlePrime();
-		}
+		} else {
+			// Foreground Prime Barrier (remove slow actions)
+			if ( function_exists( 'add_action' ) ) {
+				add_action( 'plugins_loaded', function () {
+					if ( is_admin() ) {
+						remove_action( 'load-plugins.php', 'wp_update_plugins' );
+						remove_action( 'load-update-core.php', 'wp_update_plugins' );
+						remove_action( 'load-update-core.php', 'wp_update_themes' );
+						//remove_action( 'admin_init', '_maybe_update_plugins' );
+						//remove_action( 'admin_init', '_maybe_update_themes' );
+						//remove_action( 'admin_init', '_maybe_update_core' );
+					}
+					remove_action( 'init', 'wp_cron' ); // TODO if removed -> start primer
+				} );
 
-		// remove slow actions
-		add_action( 'plugins_loaded', function () {
-			is_admin()
-			&& remove_action( 'load-plugins.php', 'wp_update_plugins' )
-			&& remove_action( 'load-update-core.php', 'wp_update_plugins' )
-			&& remove_action( 'load-update-core.php', 'wp_update_themes' );
-		} );
+				// suppress ANY shutdown actions (JetPack does a sync)
+				add_action( 'wp_loaded', function () {
+					global $wp_filter;
+					if ( isset( $wp_filter['shutdown'] ) && count( $wp_filter['shutdown']->callbacks ) > 0 ) {
+						$wp_filter['shutdown']->callbacks = [];
+						// TODO start primer
+					}
+				}, 1e9 );
+			}
+		}
 
 		register_shutdown_function( function () {
 			if ( ! $this->doingPrime ) {
@@ -83,7 +102,7 @@ class WP_Object_Cache_Shm {
 		} );
 	}
 
-	private function open() {
+	private function open() { //echo __FUNCTION__.":".__LINE__."<br>\n";
 		$this->volatileCache = array();
 		$this->missingKeys   = array();
 		$this->writeBackKeys = array();
@@ -97,18 +116,59 @@ class WP_Object_Cache_Shm {
 		$this->readExpiryTable();
 	}
 
-	public function close() {
+	// need to remap FALSE and NULL (shm_get_var can return both on corruption)
+	const FALSE = "__5cache_FALSE";
+	const NULL = "__5cache_NULL";
+
+	static function packFalse($val) {
+		if($val === false)
+			return self::FALSE;
+		if($val === null)
+			return self::NULL;
+		return $val;
+	}
+
+	static function unpackFalse($val) {
+		if(is_string($val)) {
+			if($val === self::FALSE)
+				return false;
+			if($val === self::NULL)
+				return null;
+		}
+		return $val;
+	}
+
+	public function close() { //echo __FUNCTION__.":".__LINE__."<br>\n";
+
+		$writtenAfterFlush= array();
+		$flushed = false;
 
 		// lazy write back before close
 		$writeOk = true;
 		foreach ( $this->writeBackKeys as $gKey => $expire ) {
 			$ki = self::intHash( $gKey );
-			if ( ! @shm_put_var( $this->shm, $ki, $this->volatileCache[ $gKey ] ) ) {
-				$data = $this->volatileCache[ $gKey ];
+			$data =  self::packFalse($this->volatileCache[ $gKey ]);
+			if ( ! @shm_put_var( $this->shm, $ki, $data) ) {
 				// assume fail is OOM, delete all other keys, sorry :/
-				$this->flush();
-				$writeOk &= shm_put_var( $this->shm, $ki, $data );
+				FiveCacheLogger::logMsg( "put $gKey failed (OOM?), complete flush..." );
+				$this->shmFlush();
+				$writtenAfterFlush = array();
+				$flushed = true;
+
+				if(!shm_put_var( $this->shm, $ki, $data )) {
+					$writeOk = false;
+					continue; // don't add to $writtenAfterFlush
+				}
 			}
+
+			if($flushed)
+				$writtenAfterFlush[$ki] = 1;
+		}
+
+		// if flushed during above loop, update expiry table
+		// only keep keys written after the flush
+		if(!empty($writtenAfterFlush)) {
+			$this->expiryTable = array_intersect_key($this->expiryTable , $writtenAfterFlush);
 		}
 
 		if ( $this->expiryTableUpdated ) {
@@ -116,7 +176,7 @@ class WP_Object_Cache_Shm {
 		}
 
 		if ( ! $writeOk ) {
-			error_log( '5cache: error during lazy write!' );
+			FiveCacheLogger::logMsg( "error lazy write!" );
 		}
 
 		$this->writeBackKeys = array();
@@ -268,7 +328,7 @@ class WP_Object_Cache_Shm {
 	 *
 	 * @return bool
 	 */
-	public function set( $key, $data, $group = 'default', $expire = 0 ) {
+	public function set( $key, $data, $group = 'default', $expire = 0 ) { //echo __FUNCTION__.":".__LINE__."<br>\n";
 		$gKey = $this->gKey( $key, $group );
 
 		if ( is_object( $data ) ) {
@@ -290,7 +350,7 @@ class WP_Object_Cache_Shm {
 		// update expiryTable
 		$ki = self::intHash( $gKey );
 		if ( $expire > 0 ) {
-			$this->expiryTable[ $ki ] = $this->clock + $expire + 1;
+			$this->expiryTable[ $ki ] = $this->clock + $expire + self::EXPIRE_DELAY;
 			$this->expiryTableUpdated = true;
 		} elseif ( isset( $this->expiryTable[ $ki ] ) ) {
 			unset( $this->expiryTable[ $ki ] );
@@ -312,7 +372,7 @@ class WP_Object_Cache_Shm {
 	public function get(
 		$key, $group = 'default', /** @noinspection PhpUnusedParameterInspection */
 		$force_unused = false, &$found = null
-	) {
+	) { //echo __FUNCTION__.":".__LINE__."<br>\n";
 		$gKey = $this->gKey( $key, $group );
 
 		if ( isset( $this->volatileCache[ $gKey ] ) ) {
@@ -354,37 +414,65 @@ class WP_Object_Cache_Shm {
 			return false;
 		}
 
-		$value = shm_get_var( $this->shm, $ki );
+		$value = $this->safeShmRead( $ki, $gKey );
 
-		// TODO: shm_get_var sometimes returns NULL
-		// should log this, needs investigation
-		if ( is_null( $value ) ) {
-			shm_remove_var( $this->shm, $ki );
+		if ( $value === false ) {
+			// error during read
 			$this->missingKeys[ $gKey ] = 1;
+			unset( $this->volatileCache[ $gKey ], $this->expiryTable[ $ki ] );
 			++ $this->cache_misses;
+			$found = false;
 
 			return false;
 		}
 
-		$this->volatileCache[ $gKey ] = $value;
 		++ $this->cache_hits;
+
+		return ($this->volatileCache[ $gKey ] = self::unpackFalse($value));
+	}
+
+	private function safeShmRead( $ki, $gKey ) { //echo __FUNCTION__.":".__LINE__."<br>\n";
+
+		$value = @shm_get_var( $this->shm, $ki );
+		// TODO: sometimes returns NULL, needs investigation
+		if ( $value === false || is_null( $value ) ) {
+			$err = error_get_last();
+			shm_remove_var( $this->shm, $ki );
+			// Warning: shm_get_var(): variable data in shared memory is corrupted ...
+			if ( $err && strpos( $err['message'], "variable data in shared memory is corrupted" ) !== false ) {
+				FiveCacheLogger::logMsg( "Memory corruption of $gKey!" );
+				$this->flush();
+			}
+
+			$vs = ( $value === false ) ? "FALSE" : "NULL";
+			FiveCacheLogger::logMsg( "$gKey reads $vs!" );
+
+			return false;
+		}
 
 		return $value;
 	}
 
-	private function readExpiryTable() {
+	private function readExpiryTable() { //echo __FUNCTION__.":".__LINE__."<br>\n";
 		$ki = self::intHash( '_expiry' );
 		if ( ! shm_has_var( $this->shm, $ki ) ) {
 			return;
 		}
-		$res                      = shm_get_var( $this->shm, $ki );
-		$this->expiryTable        = is_array( $res ) ? $res : array();
+		$res = $this->safeShmRead( $ki, '_expiry' );
+		if ( ! is_array( $res ) ) {
+			FiveCacheLogger::logMsg( "error reading expiry table, complete flush..." );
+			$this->flush();
+
+			return;
+		}
+		$this->expiryTable        = $res;
 		$this->expiryTableUpdated = false;
 	}
 
-	private function writeExpiryTable() {
+	private function writeExpiryTable() { //echo __FUNCTION__.":".__LINE__."<br>\n";
 		$ki = self::intHash( '_expiry' );
 		if ( ! @shm_put_var( $this->shm, $ki, $this->expiryTable ) ) {
+			FiveCacheLogger::logMsg( "error writing expiry table, complete flush..." );
 			$this->flush(); // delete all data if we can't write expiry table
 
 			return false;
@@ -398,7 +486,7 @@ class WP_Object_Cache_Shm {
 	public function _delete(
 		$key, $group = 'default', /** @noinspection PhpUnusedParameterInspection */
 		$deprecated = false
-	) {// echo "<!-- 5cache del $key -->";
+	) {//echo __FUNCTION__.":".__LINE__."<br>\n";
 		$gKey = $this->gKey( $key, $group );
 
 		$ok = isset( $this->volatileCache[ $gKey ] );
@@ -459,7 +547,7 @@ class WP_Object_Cache_Shm {
 	 *
 	 * @return bool False if cache key and group already exist, true on success.
 	 */
-	function add( $key, $data, $group = 'default', $expire = 0 ) {
+	function add( $key, $data, $group = 'default', $expire = 0 ) { //echo __FUNCTION__.":".__LINE__."<br>\n";
 		if ( $this->_exist( $key, $group ) ) {
 			return false;
 		}
@@ -499,17 +587,29 @@ class WP_Object_Cache_Shm {
 	 *
 	 * @return true Always returns true.
 	 */
-	public function flush() {
+	public function flush() { //echo __FUNCTION__.":".__LINE__."<br>\n";
+		// log sth before the actual flush to retrieve the logDir from cache!
+		FiveCacheLogger::logMsg( "flushing ... ", true );
+
 		$this->volatileCache      = array();
 		$this->writeBackKeys      = array();
 		$this->expiryTable        = array();
 		$this->expiryTableUpdated = false;
 
+		$this->shmFlush();
+
+		FiveCacheLogger::logMsg( "cache flushed! " . json_encode( debug_backtrace( DEBUG_BACKTRACE_IGNORE_ARGS ) ) );
+		if(FIVECACHE_DRY_RUN) {
+			FiveCacheLogger::logMsg( "Note that 5cache currently dry runs (FIVECACHE_DRY_RUN set)!" );
+		}
+
+		return true;
+	}
+
+	private function shmFlush() {
 		shm_remove( $this->shm );
 		$this->close();
 		$this->open();
-
-		return true;
 	}
 
 
@@ -578,6 +678,60 @@ class WP_Object_Cache_Shm {
 		$this->close();
 		$this->blog_id = $newBlogId;
 		$this->open();
+	}
+
+
+}
+
+
+class FiveCacheLogger {
+	private static function getSecret( $salt ) {
+		return hash( 'sha256', $salt . '|' . ( defined( 'NONCE_SALT' ) ? NONCE_SALT : filemtime( __FILE__ ) ) . dirname( __FILE__ ) );
+	}
+
+	private static function getLogDir() {
+		$dir = dirname( __FILE__ );
+		if ( is_writable( $dir ) ) {
+			return $dir;
+		}
+
+		if ( defined( UPLOADBLOGSDIR ) && is_dir( UPLOADBLOGSDIR ) && is_writable( UPLOADBLOGSDIR ) ) {
+			return UPLOADBLOGSDIR;
+		}
+
+		$uploadDir = $dir.'/uploads';
+		if ( is_dir($uploadDir) && is_writable($uploadDir) ) {
+			return $uploadDir;
+		}
+
+		// fallback
+		return $dir;
+	}
+
+	public static function logMsg( $str, $noLBR = false ) {
+		static $logFile = null;
+		static $wasNoLBR = false;
+		if ( $logFile === null ) {
+			$suffix  = self::getSecret( 'log' );
+			$dir     = self::getLogDir();
+			$logFile = $dir . "/._5cache-$suffix.log";
+			if ( ! ( file_exists( $logFile ) ? is_writable( $logFile ) : is_writable( $dir ) ) ) {
+				$logFile = false;
+			}
+		}
+
+		if ( ! is_string( $str ) ) {
+			$str = json_encode( $str );
+		}
+
+		$msg = $wasNoLBR ? $str : ( date( 'c' ) . ' @' . str_pad( $_SERVER['REQUEST_URI'], 30 ) . ": $str" );
+		if ( ! $noLBR ) {
+			$msg .= "\n";
+		}
+		$wasNoLBR = $noLBR;
+
+		$logFile && @error_log( $msg, 3, $logFile );
+		@error_log( $msg );
 	}
 }
 
@@ -712,6 +866,27 @@ function wp_cache_flush() {
  */
 function wp_cache_get( $key, $group = '', $force = false, &$found = null ) {
 	global $wp_object_cache;
+
+	if(FIVECACHE_DRY_RUN) {
+		$wp_object_cache->get( $key, $group, $force, $found );
+
+		if($group === 'site-transient') {
+			wp_using_ext_object_cache(false);
+			$value = get_site_transient($key);
+			wp_using_ext_object_cache(true);
+			return $value;
+		}
+
+		if($group === 'transient') {
+			wp_using_ext_object_cache(false);
+			$value = get_transient($key);
+			wp_using_ext_object_cache(true);
+			return $value;
+		}
+
+		$found = false;
+		return false;
+	}
 
 	return $wp_object_cache->get( $key, $group, $force, $found );
 }

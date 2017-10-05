@@ -1,0 +1,40 @@
+cache/site-transient/update_plugins	1580.24 ms	wpcore/admin	     4
+cache/site-transient/browser_a9db4d03969fdd98d377b682b063efe6	 436.54 ms	wpc0re/wp_dashboard_setup	     1
+cache/site-transient/update_core	  29.58 ms	wpcore/admin	     4
+cache/transient/3__2899230903	   1.84 ms	plugin/nextgen-gallery	     1
+cache/transient/2__2899230903	   0.78 ms	plugin/nextgen-gallery	     1
+cache/counts/posts-post	   0.55 ms	wpc0re/wp_dashboard	     1
+cache/counts/posts-page	   0.20 ms	wpc0re/wp_dashboard	     1
+cache/site-transient/theme_roots	   0.02 ms	wpcore/admin	     1
+cache/comment/last_changed	   0.02 ms	wpc0re/wp_dashboard	     1
+
+
+
+
+/*
+TODO: every 10 seconds spawn a background cache primer. this will look for soon to expiring keys, flushes them!
+*/
+
+cache/site-transient/poptags_40cd750bba9870f18aada2478b24840a	 719.77 ms	plugin/hook-prof	     1
+
+cache/site-transient/update_plugins	1629.58 ms	wpcore/admin	     4
+cache/plugins/plugins	 373.60 ms	plugin/wp-optimize	     1
+cache/site-transient/update_core	   8.84 ms	wpcore/admin	     4
+cache/transient/2__2899230903	   0.22 ms	plugin/nextgen-gallery	     1
+cache/transient/3__2899230903	   0.22 ms	plugin/nextgen-gallery	     1
+cache/counts/comments-0	   0.08 ms	wpcore/menu	     1
+cache/transient/doing_cron	   0.05 ms	wpcore/wp-settings	     1
+cache/freemius/fs_accounts	   0.03 ms	plugin/nextgen-gallery	     1
+cache/site-transient/theme_roots	   0.02 ms	wpcore/admin	     1
+cache/terms/last_changed	   0.01 ms	plugin/ninja-forms	     1
+
+// cache/plugins/plugins
+// http://local.wordpress.dev/wp-admin/plugins.php
+
+
+wp_cache_add_non_persistent_groups( 'themes' );
+ //wp_cache_add_non_persistent_groups( array( 'counts', 'plugins' ) );
+
+ wp_cache_add_global_groups( array( 'users', 'userlogins', 'usermeta', 'user_meta', 'useremail', 'userslugs', 'site-transient', 'site-options', 'blog-lookup', 'blog-details', 'site-details', 'rss', 'global-posts', 'blog-id-cache', 'networks', 'sites' ) );
+
+ wp_cache_add_global_groups( array( 'users', 'userlogins', 'usermeta', 'user_meta', 'useremail', 'userslugs', 'site-transient', 'site-options', 'blog-lookup', 'blog-details', 'rss', 'global-posts', 'blog-id-cache', 'networks', 'sites', 'site-details' ) );
