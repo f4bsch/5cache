@@ -73,6 +73,8 @@ class WP_Object_Cache_Shm {
 
 
 		$this->open();
+		//$this->segvDetectorEnter();
+
 		//self::dbg( __FUNCTION__ . ":" . __LINE__ . "<br>\n" );
 		$this->clock = ( isset( $_SERVER['REQUEST_TIME'] ) ? $_SERVER['REQUEST_TIME'] : time() );
 
@@ -98,7 +100,7 @@ class WP_Object_Cache_Shm {
 				add_action( 'wp_loaded', function () {
 					global $wp_filter;
 					if ( isset( $wp_filter['shutdown'] ) && count( $wp_filter['shutdown']->callbacks ) > 0 ) {
-						$wp_filter['shutdown']->callbacks = [];
+						$wp_filter['shutdown']->callbacks = [ ];
 						// TODO start primer
 					}
 				}, 1e9 );
@@ -109,12 +111,35 @@ class WP_Object_Cache_Shm {
 			if ( ! $this->doingPrime ) {
 				$this->maybeSpawnPrimers();
 			}
+
+
 			register_shutdown_function( function () {
-				register_shutdown_function( array( $this, 'close' ) );  // close very, very late
+				register_shutdown_function( array( $this, '_veryLateShutdown' ) );  // close very, very late
 			} );
 		} );
 
 		//self::dbg( __FUNCTION__ . ":" . __LINE__ . "<br>\n" );
+	}
+
+	public function _veryLateShutdown() {
+		//FiveCacheLogger::logMsg("veryLateShutdown");
+		$this->close();
+		//FiveCacheLogger::logMsg("veryLateShutdown afterClose");
+
+		/*
+		ignore_user_abort();
+		$levels = ob_get_level();
+		for ( $i = 0; $i < $levels; $i ++ ) {
+			ob_end_flush();
+		}
+		flush();
+		session_write_close();
+		// Do processing here
+
+		FiveCacheLogger::logMsg("veryLateShutdown startSleep");
+		sleep(30);
+		FiveCacheLogger::logMsg("wow still running after 30s");
+		*/
 	}
 
 	private function shmAttach() {
@@ -164,15 +189,72 @@ class WP_Object_Cache_Shm {
 		return $val;
 	}
 
-	public function segvDetector( $end = false ) {
-		//TODO
+	private $segvDetectorEntered = false;
+
+	const OOM = "not enough shared memory left";
+
+	public function segvDetectorEnter() {
+		$this->dbg( "segvDetectorEnter" );
+		if ( $this->segvDetectorEntered ) {
+			return true;
+		}
+
+		if(!$this->sem()) {
+			FiveCacheLogger::logMsg("error: segvDetectorEnter(): sem() failed!");
+			return false;
+		}
+
+		$gKey = "_5_seg_flag";
+		$ki   = self::intHash( $gKey );
+
+		if ( shm_has_var( $this->shm, $ki ) ) {
+			$tFlag  = $this->safeShmRead( $ki, $gKey );
+			$tSince = round( $_SERVER['REQUEST_TIME_FLOAT'] - $tFlag, 3 );
+			FiveCacheLogger::logMsg( "error: SEGV or unexpected shutdown $tSince s ago (req @$tFlag)!" );
+			$this->shmClear();
+		}
+
+
+		if ( ! @shm_put_var( $this->shm, $ki, $_SERVER['REQUEST_TIME_FLOAT'] ) ) {
+			$oom = self::checkLastError( self::OOM  );
+
+			FiveCacheLogger::logMsg( "error: setting $gKey (OOM=$oom), complete flush..." );
+			$this->shmClear();
+			if ( ! shm_put_var( $this->shm, $ki, $_SERVER['REQUEST_TIME_FLOAT'] ) ) {
+				FiveCacheLogger::logMsg( "critical error: setting $gKey even failed after flush!" );
+			} else {
+				$this->segvDetectorEntered = true;
+			}
+		} else {
+			$this->segvDetectorEntered = true;
+		}
+
+		return $this->segvDetectorEntered;
+	}
+
+	public function segvDetectorLeave() {
+		$this->dbg( "segvDetectorLeave" );
+		if ( ! $this->segvDetectorEntered ) {
+			FiveCacheLogger::logMsg( "warning: called segvDetectorLeave() but did not enter before!" );
+
+			return;
+		}
+
+		$gKey = "_5_seg_flag";
+		$ki   = self::intHash( $gKey );
+
+		if ( ! shm_remove_var( $this->shm, $ki ) ) {
+			FiveCacheLogger::logMsg( "error: removing $gKey failed!" );
+		} else {
+			$this->segvDetectorEntered = false;
+		}
 	}
 
 	private $semId = null;
 
 	private function shmKey() {
 		return ftok( __FILE__, chr( 32 + ( $this->blog_id % 94 ) ) );
-}
+	}
 
 	private function sem() {
 		static $acquired = false;
@@ -183,8 +265,8 @@ class WP_Object_Cache_Shm {
 		self::dbg( __FUNCTION__ . ":" . __LINE__ . ' sem_acquire ...' );
 
 		$this->semId = sem_get( $this->shmKey() );
-		$i = 0;
-		$t = microtime( true ); // TODO debug
+		$i           = 0;
+		$t           = microtime( true ); // TODO debug
 		/** @noinspection PhpMethodParametersCountMismatchInspection */
 		while ( ( $needToWait = ! sem_acquire( $this->semId, true ) ) ) { // 2nd parameter $nowait added PHP5.6.1
 			if ( $i == 0 ) {
@@ -217,7 +299,7 @@ class WP_Object_Cache_Shm {
 	}
 
 	public function close() {
-		self::dbg( "close(), writing " . count( $this->writeBackKeys ) . " values... " );
+		self::dbg( "close(), writing " . count( $this->writeBackKeys ) . " values, had $this->cache_hits hits and $this->cache_misses misses ... " );
 
 		$t = microtime( true ); // TODO debug
 
@@ -243,8 +325,7 @@ class WP_Object_Cache_Shm {
 			$ki   = self::intHash( $gKey );
 			$data = self::packFalse( $this->volatileCache[ $gKey ] );
 
-			// shm_put_var can cause SEGV and an instant PHP shutdown
-			$this->segvDetector();
+			// shm_put_var can cause SEGV and an instant PHP process kill
 			if ( ! $this->sem() ) {
 				// without a safe sem access we should not write!
 				FiveCacheLogger::logMsg( "error: sem() failed while writing $gKey, will drop all volatile data!" );
@@ -253,10 +334,12 @@ class WP_Object_Cache_Shm {
 				return false;
 			}
 
-			// C code: https://github.com/php/php-src/blob/master/ext/sysvshm/sysvshm.c#L246
+			$this->segvDetectorEnter();
+
+			/** @see https://github.com/php/php-src/blob/master/ext/sysvshm/sysvshm.c#L246 */
 			if ( ! @shm_put_var( $this->shm, $ki, $data ) ) {
-				$oom = self::checkLastError("not enough shared memory left");
-				self::dbg( __FUNCTION__ . ":" . __LINE__ . "shm_put_var fail! (oom=$oom)");
+				$oom = self::checkLastError( "not enough shared memory left" );
+				self::dbg( __FUNCTION__ . ":" . __LINE__ . "shm_put_var fail! (oom=$oom)" );
 				FiveCacheLogger::logMsg( "error: put $gKey failed (OOM=$oom), complete flush..." );
 				$this->shmClear(); // delete all other keys, sorry :/
 				$writtenAfterFlush = array();
@@ -283,7 +366,7 @@ class WP_Object_Cache_Shm {
 		}
 
 		if ( $this->expiryTableUpdated ) {
-			$this->segvDetector();
+			$this->segvDetectorEnter();
 			if ( ! $this->sem() ) {
 				// this should never happen, because any change to the expiry table requires a write
 				// and we already sem() above // TODO remove
@@ -295,7 +378,6 @@ class WP_Object_Cache_Shm {
 			$writeOk &= $this->writeExpiryTable();
 		}
 
-		$this->segvDetector( true );
 
 		if ( ! $writeOk ) {
 			FiveCacheLogger::logMsg( "close(): error writing shm!" );
@@ -303,6 +385,7 @@ class WP_Object_Cache_Shm {
 
 		$this->writeBackKeys = array();
 
+		$this->segvDetectorLeave();
 		$ok        = shm_detach( $this->shm );
 		$this->shm = null;
 
@@ -360,6 +443,7 @@ class WP_Object_Cache_Shm {
 
 		add_action( 'plugins_loaded', function () {
 			if ( ! function_exists( 'wp_verify_nonce' ) ) {
+				/** @noinspection PhpIncludeInspection */
 				require_once( ABSPATH . WPINC . '/pluggable.php' );
 			}
 			$this->doingPrime = isset( $_GET['5n'] ) && wp_verify_nonce( $_GET['5n'], "5cache-prime=" . $_GET['5cache-prime'] );
@@ -413,6 +497,7 @@ class WP_Object_Cache_Shm {
 			'plugins:plugins'               => array(
 				'admin_screens' => [ 'plugins' => 1, 'update-core' => 1 ],
 				'func'          => function () {
+					/** @noinspection PhpIncludeInspection */
 					! function_exists( 'get_plugins' ) && require_once( ABSPATH . 'wp-admin/includes/plugin.php' );
 					get_plugins();
 				}
@@ -423,6 +508,7 @@ class WP_Object_Cache_Shm {
 					wp_update_plugins();
 
 					// ... prime poptags
+					/** @noinspection PhpIncludeInspection */
 					! function_exists( 'install_popular_tags' ) && require_once( ABSPATH . 'wp-admin/includes/plugin-install.php' );
 					install_popular_tags();
 				}
@@ -567,14 +653,16 @@ class WP_Object_Cache_Shm {
 		}
 
 		++ $this->cache_hits;
+
 		//$this->volatileCache[ $gKey ] = $value;
 
 		return ( $this->volatileCache[ $gKey ] = self::unpackFalse( $value ) );
 	}
 
-	private static function checkLastError($forMessage) {
+	private static function checkLastError( $forMessage ) {
 		$err = error_get_last();
-		return ($err &&  stripos( $err['message'], $forMessage ) !== false);
+
+		return ( $err && stripos( $err['message'], $forMessage ) !== false );
 	}
 
 	private function safeShmRead( $ki, $gKey ) {
@@ -583,8 +671,8 @@ class WP_Object_Cache_Shm {
 		$value = @shm_get_var( $this->shm, $ki );
 		// TODO: sometimes returns NULL, needs investigation
 		if ( $value === false || is_null( $value ) ) {
-			// see https://github.com/php/php-src/blob/master/ext/sysvshm/sysvshm.c#L313
-			$shmCorrupt = self::checkLastError("variable data in shared memory is corrupted");
+			/** @see https://github.com/php/php-src/blob/master/ext/sysvshm/sysvshm.c#L313 */
+			$shmCorrupt = self::checkLastError( "variable data in shared memory is corrupted" );
 			shm_remove_var( $this->shm, $ki );
 			// Warning: shm_get_var(): variable data in shared memory is corrupted ...
 			if ( $shmCorrupt ) {
@@ -622,7 +710,7 @@ class WP_Object_Cache_Shm {
 		self::dbg( __FUNCTION__ . ":" . __LINE__ );
 		$ki = self::intHash( '_expiry' );
 		if ( ! @shm_put_var( $this->shm, $ki, $this->expiryTable ) ) {
-			$oom = self::checkLastError("not enough shared memory left");
+			$oom = self::checkLastError( "not enough shared memory left" );
 			FiveCacheLogger::logMsg( "error writing expiry table (OOM=$oom), complete flush..." );
 			$this->shmClear(); // delete all data if we can't write expiry table
 
@@ -640,15 +728,16 @@ class WP_Object_Cache_Shm {
 	) {
 		$gKey = $this->gKey( $key, $group );
 
-		self::dbg( "_delete(): $gKey");
+		self::dbg( "_delete(): $gKey" );
 
 		$ok = isset( $this->volatileCache[ $gKey ] );
 
 		unset( $this->volatileCache[ $gKey ], $this->writeBackKeys[ $gKey ] );
 		$this->missingKeys[ $gKey ] = 1;
 
-		$ki = self::intHash( $key );
+		$ki = self::intHash( $gKey );
 		if ( ! shm_has_var( $this->shm, $ki ) ) {
+			FiveCacheLogger::logMsg( "delete($gKey), but not found in shm (shm_has_var), found in volatile='$ok'" );
 
 			return $ok;
 		}
@@ -656,7 +745,14 @@ class WP_Object_Cache_Shm {
 		unset( $this->expiryTable[ $ki ] );
 		$this->expiryTableUpdated = true;
 
-		return shm_remove_var( $this->shm, $ki ) || $ok;
+		self::dbg( "_delete(): $gKey shm_remove_var ..." );
+		if ( ! shm_remove_var( $this->shm, $ki ) ) {
+			FiveCacheLogger::logMsg( "error: delete($gKey), supposed to be in shm, but shm_remove_var returned false, volatile='$ok'" );
+
+			return $ok;
+		}
+
+		return true;
 	}
 
 
@@ -702,8 +798,10 @@ class WP_Object_Cache_Shm {
 	 */
 	function add( $key, $data, $group = 'default', $expire = 0 ) {
 		if ( $this->_exist( $key, $group ) ) {
-			if(!FIVECACHE_DRY_RUN)
-				self::dbg( "warning: add() $group:$key exists (expire=$expire)!");
+			if ( ! FIVECACHE_DRY_RUN ) {
+				self::dbg( "warning: add() $group:$key exists (expire=$expire)!" );
+			}
+
 			return false;
 		}
 
