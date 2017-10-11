@@ -238,7 +238,7 @@ class WP_Object_Cache_Shm {
 		// lazy write back before close
 		$writeOk = true;
 		foreach ( $this->writeBackKeys as $gKey => $expire ) {
-			self::dbg( "close(), writing $gKey, expire=$expire ... " );
+			//self::dbg( "close(), writing $gKey, expire=$expire ... " );
 
 			$ki   = self::intHash( $gKey );
 			$data = self::packFalse( $this->volatileCache[ $gKey ] );
@@ -253,11 +253,12 @@ class WP_Object_Cache_Shm {
 				return false;
 			}
 
+			// C code: https://github.com/php/php-src/blob/master/ext/sysvshm/sysvshm.c#L246
 			if ( ! @shm_put_var( $this->shm, $ki, $data ) ) {
-				self::dbg( __FUNCTION__ . ":" . __LINE__ );
-				// assume fail is OOM, delete all other keys, sorry :/
-				FiveCacheLogger::logMsg( "error: put $gKey failed (OOM?), complete flush..." );
-				$this->shmClear();
+				$oom = self::checkLastError("not enough shared memory left");
+				self::dbg( __FUNCTION__ . ":" . __LINE__ . "shm_put_var fail! (oom=$oom)");
+				FiveCacheLogger::logMsg( "error: put $gKey failed (OOM=$oom), complete flush..." );
+				$this->shmClear(); // delete all other keys, sorry :/
 				$writtenAfterFlush = array();
 				$flushed           = true;
 
@@ -297,7 +298,7 @@ class WP_Object_Cache_Shm {
 		$this->segvDetector( true );
 
 		if ( ! $writeOk ) {
-			FiveCacheLogger::logMsg( "error writing shm!" );
+			FiveCacheLogger::logMsg( "close(): error writing shm!" );
 		}
 
 		$this->writeBackKeys = array();
@@ -566,8 +567,14 @@ class WP_Object_Cache_Shm {
 		}
 
 		++ $this->cache_hits;
+		//$this->volatileCache[ $gKey ] = $value;
 
 		return ( $this->volatileCache[ $gKey ] = self::unpackFalse( $value ) );
+	}
+
+	private static function checkLastError($forMessage) {
+		$err = error_get_last();
+		return ($err &&  stripos( $err['message'], $forMessage ) !== false);
 	}
 
 	private function safeShmRead( $ki, $gKey ) {
@@ -576,10 +583,11 @@ class WP_Object_Cache_Shm {
 		$value = @shm_get_var( $this->shm, $ki );
 		// TODO: sometimes returns NULL, needs investigation
 		if ( $value === false || is_null( $value ) ) {
-			$err = error_get_last();
+			// see https://github.com/php/php-src/blob/master/ext/sysvshm/sysvshm.c#L313
+			$shmCorrupt = self::checkLastError("variable data in shared memory is corrupted");
 			shm_remove_var( $this->shm, $ki );
 			// Warning: shm_get_var(): variable data in shared memory is corrupted ...
-			if ( $err && strpos( $err['message'], "variable data in shared memory is corrupted" ) !== false ) {
+			if ( $shmCorrupt ) {
 				FiveCacheLogger::logMsg( "error: memory corruption of $gKey!" );
 				$this->flush();
 			}
@@ -614,7 +622,8 @@ class WP_Object_Cache_Shm {
 		self::dbg( __FUNCTION__ . ":" . __LINE__ );
 		$ki = self::intHash( '_expiry' );
 		if ( ! @shm_put_var( $this->shm, $ki, $this->expiryTable ) ) {
-			FiveCacheLogger::logMsg( "error writing expiry table, complete flush..." );
+			$oom = self::checkLastError("not enough shared memory left");
+			FiveCacheLogger::logMsg( "error writing expiry table (OOM=$oom), complete flush..." );
 			$this->shmClear(); // delete all data if we can't write expiry table
 
 			return false;
@@ -629,8 +638,9 @@ class WP_Object_Cache_Shm {
 		$key, $group = 'default', /** @noinspection PhpUnusedParameterInspection */
 		$deprecated = false
 	) {
-		self::dbg( __FUNCTION__ . ":" . __LINE__ );
 		$gKey = $this->gKey( $key, $group );
+
+		self::dbg( "_delete(): $gKey");
 
 		$ok = isset( $this->volatileCache[ $gKey ] );
 
@@ -691,8 +701,9 @@ class WP_Object_Cache_Shm {
 	 * @return bool False if cache key and group already exist, true on success.
 	 */
 	function add( $key, $data, $group = 'default', $expire = 0 ) {
-		self::dbg( __FUNCTION__ . ":" . __LINE__ );
 		if ( $this->_exist( $key, $group ) ) {
+			if(!FIVECACHE_DRY_RUN)
+				self::dbg( "warning: add() $group:$key exists (expire=$expire)!");
 			return false;
 		}
 
@@ -744,17 +755,20 @@ class WP_Object_Cache_Shm {
 		$this->shmClear();
 
 		FiveCacheLogger::logMsg( "cache flushed! " . json_encode( debug_backtrace( DEBUG_BACKTRACE_IGNORE_ARGS ) ) );
-		if ( FIVECACHE_DRY_RUN ) {
-			FiveCacheLogger::logMsg( "Note that 5cache currently dry runs (FIVECACHE_DRY_RUN set)!" );
-		}
 
 		return true;
 	}
 
 	private function shmClear() {
+		$sh = $this->shm;
 		shm_remove( $this->shm );
 		shm_detach( $this->shm );
 		$this->shmAttach();
+
+		FiveCacheLogger::logMsg( "shared memory $sh cleared!" );
+		if ( FIVECACHE_DRY_RUN ) {
+			FiveCacheLogger::logMsg( "Note that 5cache currently dry runs (FIVECACHE_DRY_RUN set)!" );
+		}
 	}
 
 
@@ -1098,6 +1112,30 @@ function wp_cache_replace( $key, $data, $group = '', $expire = 0 ) {
  */
 function wp_cache_set( $key, $data, $group = '', $expire = 0 ) {
 	global $wp_object_cache;
+
+
+	if ( FIVECACHE_DRY_RUN ) {
+		$result = $wp_object_cache->set( $key, $data, $group, (int) $expire );
+
+		if ( $group === 'site-transient' ) {
+			wp_using_ext_object_cache( false );
+			$result = set_site_transient( $key, $data, $expire );
+			wp_using_ext_object_cache( true );
+
+			return $result;
+		}
+
+		if ( $group === 'transient' ) {
+			wp_using_ext_object_cache( false );
+			$result = set_transient( $key, $data, $expire );
+			wp_using_ext_object_cache( true );
+
+			return $result;
+		}
+
+
+		return $result;
+	}
 
 	return $wp_object_cache->set( $key, $data, $group, (int) $expire );
 }
