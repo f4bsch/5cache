@@ -37,22 +37,25 @@ usually persistent cache groups: [counts,plugins,themes]
 */
 
 defined( 'FIVECACHE_DRY_RUN' ) || define( 'FIVECACHE_DRY_RUN', false );
+defined( 'FIVECACHE_OPT_DEFER' ) || define( 'FIVECACHE_OPT_DEFER', true );
+
 
 class WP_Object_Cache_Shm {
 	const MAX_CACHE_SIZE = 1024 * 1024 * 4;
 	const EXPIRE_DELAY = 0;
 
-	private $multisite;
-	private $blog_id;
-
-	// stats are public
+	/* public stats */
 	public $cache_misses = 0;
 	public $cache_hits = 0;
 
 	public $global_groups = array(); // TODO
 	public $non_persistent_groups = array();
 
+	private $multisite;
+	private $blog_id;
+
 	private $shm = null;
+	private $semId = null;
 
 	private $volatileCache = array();
 	private $writeBackKeys = array();
@@ -60,10 +63,15 @@ class WP_Object_Cache_Shm {
 	private $expiryTable = array();
 
 	private $expiryTableUpdated = false;
+	private $segvDetectorEntered = false;
 
 	private $clock = 0;
 
-	private $doingPrime = false;
+	/* need to remap FALSE and NULL (shm_get_var can return both on corruption) */
+	const FALSE = "__5cache_FALSE";
+	const NULL = "__5cache_NULL";
+
+	const OOM = "not enough shared memory left";
 
 
 	public function __construct() {
@@ -71,57 +79,405 @@ class WP_Object_Cache_Shm {
 		$this->multisite = function_exists( 'is_multisite' ) && is_multisite();
 		$this->blog_id   = $this->multisite ? ( 1 + get_current_blog_id() ) : 0;
 
-		$this->open();
-		//$this->segvDetectorEnter();
-
-		//self::dbg( __FUNCTION__ . ":" . __LINE__ . "<br>\n" );
 		$this->clock = ( isset( $_SERVER['REQUEST_TIME'] ) ? $_SERVER['REQUEST_TIME'] : time() );
 
-		if ( isset( $_GET['5cache-prime'] ) ) {
-			// Background Primer
-			$this->handlePrime();
-		} else {
-			// Foreground Prime Barrier (remove slow actions)
-			if ( function_exists( 'add_action' ) ) {
-				add_action( 'plugins_loaded', function () {
-					if ( is_admin() ) {
-						remove_action( 'load-plugins.php', 'wp_update_plugins' );
-						remove_action( 'load-update-core.php', 'wp_update_plugins' );
-						remove_action( 'load-update-core.php', 'wp_update_themes' );
-						//remove_action( 'admin_init', '_maybe_update_plugins' );
-						//remove_action( 'admin_init', '_maybe_update_themes' );
-						//remove_action( 'admin_init', '_maybe_update_core' );
-					}
-					remove_action( 'init', 'wp_cron' ); // TODO if removed -> start primer
-				} );
+		$this->open();
 
-				// suppress ANY shutdown actions (JetPack does a sync)
-				add_action( 'wp_loaded', function () {
-					global $wp_filter;
-					if ( isset( $wp_filter['shutdown'] ) && count( $wp_filter['shutdown']->callbacks ) > 0 ) {
-						$wp_filter['shutdown']->callbacks = [ ];
-						// TODO start primer
-					}
-				}, 1e9 );
+		$primer = new FiveCachePrimer( $this );
+		FIVECACHE_OPT_DEFER && $primer->enableDeferOptimization();
+		$primer->onPrime( function () {
+			$this->housekeeping();
+		} );
+
+		// close very, very late
+		register_shutdown_function( function () {
+			register_shutdown_function( function () {
+				register_shutdown_function( array( $this, 'close' ) );
+			} );
+		} );
+	}
+
+	private function open() {
+		$this->volatileCache = array();
+		$this->missingKeys   = array();
+		$this->writeBackKeys = array();
+
+		$this->shmAttach();
+		$this->readExpiryTable();
+	}
+
+	public function close() {
+		//return;
+		self::dbg( "close(), writing " . count( $this->writeBackKeys ) . " values, had $this->cache_hits hits and $this->cache_misses misses ... " );
+
+		if ( ! $this->shm ) {
+			return false;
+		}
+
+		$t = microtime( true ); // TODO debug
+
+		// PHP shm is buggy, writes can cause SEGV. send all content to the peer, just in case
+		self::sendAndClosePeerSession();
+
+		// in case of write failed, keep track of keys written after the flush
+		$writtenAfterFlush = array();
+		$flushed           = false;
+
+		$writeOk = true;
+		foreach ( $this->writeBackKeys as $gKey => $expire ) {
+			//self::dbg( "close(), writing $gKey, expire=$expire ... " );
+
+			$ki   = self::intHash( $gKey );
+			$data = self::shmPack( $this->volatileCache[ $gKey ] );
+
+			if ( ! $this->sem() ) {
+				FiveCacheLogger::logMsg( "error: sem() failed while writing $gKey, will drop all volatile data!" );
+				shm_detach( $this->shm );
+
+				return false;
+			}
+
+			$this->segvDetectorEnter();
+
+			/** @see https://github.com/php/php-src/blob/master/ext/sysvshm/sysvshm.c#L246 */
+			if ( ! @shm_put_var( $this->shm, $ki, $data ) ) {
+				$oom = self::checkLastError( "not enough shared memory left" );
+				FiveCacheLogger::logMsg( "error: put $gKey failed (OOM=$oom), complete flush..." );
+				$this->shmClear(); // delete all other keys, sorry :/
+				$writtenAfterFlush = array();
+				$flushed           = true;
+
+				if ( ! shm_put_var( $this->shm, $ki, $data ) ) {
+					$writeOk = false;
+					continue; // don't add to $writtenAfterFlush
+				}
+			}
+
+			if ( $flushed ) {
+				$writtenAfterFlush[ $ki ] = 1;
 			}
 		}
 
-		register_shutdown_function( function () {
-			if ( ! $this->doingPrime ) {
-				$this->maybeSpawnPrimers();
+		//self::dbg( __FUNCTION__ . ":" . __LINE__ );
+
+		// if flushed during above loop, update expiry table
+		// only keep keys written after the flush
+		if ( $flushed ) {
+			//self::dbg( __FUNCTION__ . ":" . __LINE__ );
+			$this->expiryTable        = array_intersect_key( $this->expiryTable, $writtenAfterFlush );
+			$this->expiryTableUpdated = true;
+		}
+
+		if ( $this->expiryTableUpdated ) {
+			$this->segvDetectorEnter();
+			if ( ! $this->sem() ) {
+				// this should never happen, because any change to the expiry table requires a write
+				// and we already sem() above // TODO remove
+				FiveCacheLogger::logMsg( "error: sem() failed while writing expiry table, will drop all volatile data!" );
+				shm_detach( $this->shm );
+
+				return false;
 			}
+			$writeOk &= $this->writeExpiryTable();
+		}
 
 
-			register_shutdown_function( function () {
-				register_shutdown_function( array( $this, '_veryLateShutdown' ) );  // close very, very late
-			} );
-		} );
+		if ( ! $writeOk ) {
+			FiveCacheLogger::logMsg( "close(): error writing shm!" );
+		}
 
-		//self::dbg( __FUNCTION__ . ":" . __LINE__ . "<br>\n" );
+		$this->writeBackKeys = array();
+
+		$this->segvDetectorLeave();
+
+		$ok        = shm_detach( $this->shm );
+		$this->shm = null;
+
+		if ( $this->semId ) {
+			self::dbg( "close(): sem release" );
+			// release the semaphore by deleting any reference
+			$this->semId = null;
+		}
+
+
+		$t = round( ( microtime( true ) - $t ) * 1e3 );
+		self::dbg( "close function took $t ms" );
+
+		return $ok;
 	}
 
-	public function _veryLateShutdown() {
-		$this->close();
+	/**
+	 * @param string $key
+	 * @param mixed $data
+	 * @param string $group
+	 * @param int $expire
+	 *
+	 * @return bool
+	 */
+	public function set( $key, $data, $group = 'default', $expire = 0 ) {
+		if ( $this->shm === null ) {
+			FiveCacheLogger::logMsg( "error: set() after close $key group=$group, ignoring!" );
+
+			return false;
+		}
+
+		self::dbg( "set(): $key, group=$group, expire=$expire, len=" . strlen( serialize( $data ) ) );
+		//return;
+
+		$gKey = $this->gKey( $key, $group );
+
+		if ( is_object( $data ) ) {
+			$data = clone $data;
+		}
+
+		$this->volatileCache[ $gKey ] = $data;
+		$this->writeBackKeys[ $gKey ] = $expire;
+		unset( $this->missingKeys[ $gKey ] );
+
+
+		// if no expiry is set is in a non persistent group, set expire to a fixed value (5min)
+		if ( $expire <= 0 ) {
+			if ( isset( $this->non_persistent_groups[ $group ] ) ) {
+				$expire = 300;
+			}
+		}
+
+		// update expiryTable
+		$ki = self::intHash( $gKey );
+		if ( $expire > 0 ) {
+			$this->expiryTable[ $ki ] = $this->clock + $expire + self::EXPIRE_DELAY;
+			$this->expiryTableUpdated = true;
+		} elseif ( isset( $this->expiryTable[ $ki ] ) ) {
+			unset( $this->expiryTable[ $ki ] );
+			$this->expiryTableUpdated = true;
+		}
+
+		self::dbg( "set(): end" );
+
+
+		return true;
+	}
+
+	/**
+	 * @param $key
+	 * @param string $group
+	 * @param bool $force force an update of the volatile cache from shm cache
+	 * @param null $found
+	 *
+	 * @return bool|mixed
+	 * @internal param bool $force_unused
+	 */
+	public function get( $key, $group = 'default', $force = false, &$found = null ) {
+		//$found = false;
+		//return false;
+
+		//self::dbg( __FUNCTION__ . ":" . __LINE__  );
+		$gKey = $this->gKey( $key, $group );
+
+		if ( !$force && isset( $this->volatileCache[ $gKey ] ) ) {
+			$found = true;
+			++ $this->cache_hits;
+
+			if ( is_object( $this->volatileCache[ $gKey ] ) ) {
+				return clone $this->volatileCache[ $gKey ];
+			} else {
+				return $this->volatileCache[ $gKey ];
+			}
+		}
+
+		if ( !$force && isset( $this->missingKeys[ $gKey ] ) ) {
+			$found = false;
+			++ $this->cache_misses;
+
+			return false;
+		}
+
+		$ki = self::intHash( $gKey );
+
+		// check expiry
+		if ( isset( $this->expiryTable[ $ki ] ) && $this->expiryTable[ $ki ] < $this->clock ) {
+			$this->missingKeys[ $gKey ] = true;
+			unset( $this->volatileCache[ $gKey ], $this->expiryTable[ $ki ] );
+			$found = false;
+			++ $this->cache_misses;
+
+			return false;
+		}
+
+
+		self::dbg( "get(): shm_has_var" );
+
+
+		$found = shm_has_var( $this->shm, $ki );
+		if ( ! $found ) {
+			$this->missingKeys[ $gKey ] = 1;
+			++ $this->cache_misses;
+
+			return false;
+		}
+
+		self::dbg( "get(): safeShmRead" );
+
+		$value = $this->shmReadSafe( $ki, $gKey );
+
+		if ( $value === false ) {
+			// error during read
+			$this->missingKeys[ $gKey ] = 1;
+			unset( $this->volatileCache[ $gKey ], $this->expiryTable[ $ki ] );
+			++ $this->cache_misses;
+			$found = false;
+
+			return false;
+		}
+
+		++ $this->cache_hits;
+
+		//$this->volatileCache[ $gKey ] = $value;
+
+		return ( $this->volatileCache[ $gKey ] = self::shmUnpack( $value ) );
+	}
+
+	public function delete(
+		$key, $group = 'default', /** @noinspection PhpUnusedParameterInspection */
+		$deprecated = false
+	) {
+		//return true;
+		$gKey = $this->gKey( $key, $group );
+
+		self::dbg( "delete(): $gKey" );
+
+		$ok = isset( $this->volatileCache[ $gKey ] );
+
+		unset( $this->volatileCache[ $gKey ], $this->writeBackKeys[ $gKey ] );
+		$this->missingKeys[ $gKey ] = 1;
+
+		$ki = self::intHash( $gKey );
+		if ( ! shm_has_var( $this->shm, $ki ) ) {
+			FiveCacheLogger::logMsg( "delete($gKey), but not found in shm (shm_has_var), found in volatile='$ok'" );
+
+			return $ok;
+		}
+
+		unset( $this->expiryTable[ $ki ] );
+		$this->expiryTableUpdated = true;
+
+		self::dbg( "delete(): $gKey shm_remove_var ..." );
+		if ( ! shm_remove_var( $this->shm, $ki ) ) {
+			FiveCacheLogger::logMsg( "error: delete($gKey), supposed to be in shm, but shm_remove_var returned false, volatile='$ok'" );
+
+			return $ok;
+		}
+
+		return true;
+	}
+
+
+	private function _exist( $key, $group ) {
+		$gKey = $this->gKey( $key, $group );
+
+		if ( isset( $this->volatileCache[ $gKey ] ) ) {
+			return true;
+		}
+
+		if ( isset( $this->missingKeys[ $gKey ] ) ) {
+			return false;
+		}
+
+		$ki = self::intHash( $gKey );
+		if ( isset( $this->expiryTable[ $ki ] ) && $this->expiryTable[ $ki ] < $this->clock ) {
+			$this->missingKeys[ $gKey ] = true;
+			unset( $this->volatileCache[ $gKey ], $this->expiryTable[ $ki ] );
+
+			return false;
+		}
+
+		self::dbg( "_exist()");
+
+		if ( shm_has_var( $this->shm, $ki ) ) {
+			return true;
+		} else {
+			$this->missingKeys[ $gKey ] = true;
+
+			return false;
+		}
+	}
+
+	/**
+	 * Clears the object cache of all data.
+	 *
+	 * @since 2.0.0
+	 * @access public
+	 *
+	 * @return true Always returns true.
+	 */
+	public function flush() {
+		self::dbg( __FUNCTION__ . ":" . __LINE__ );
+		// log sth before the actual flush to retrieve the logDir from cache!
+		FiveCacheLogger::logMsg( "flushing ... ", true );
+
+		$this->volatileCache      = array();
+		$this->writeBackKeys      = array();
+		$this->expiryTable        = array();
+		$this->expiryTableUpdated = false;
+
+		$this->shmClear();
+
+		FiveCacheLogger::logMsg( "cache flushed! " . json_encode( debug_backtrace( DEBUG_BACKTRACE_IGNORE_ARGS ) ) );
+
+		return true;
+	}
+
+
+	/**
+	 * Delete expired data from shared memory. Does not touch volatile cache layer
+	 */
+	private function housekeeping() {
+		foreach ( $this->expiryTable as $ki => $expireAt ) {
+			if ( $expireAt > $this->clock && shm_has_var( $this->shm, $ki ) ) {
+				shm_remove_var( $this->shm, $ki );
+				unset( $this->expiryTable [ $ki ] );
+				$this->expiryTableUpdated = true;
+			}
+		}
+	}
+
+	private function readExpiryTable() {
+		self::dbg( __FUNCTION__ . ":" . __LINE__ );
+		$ki = self::intHash( '_expiry' );
+		if ( ! shm_has_var( $this->shm, $ki ) ) {
+			return;
+		}
+		$res = $this->shmReadSafe( $ki, '_expiry' );
+		if ( ! is_array( $res ) ) {
+			FiveCacheLogger::logMsg( "error reading expiry table, complete flush..." );
+			$this->flush();
+
+			return;
+		}
+		$this->expiryTable        = $res;
+		$this->expiryTableUpdated = false;
+	}
+
+	private function writeExpiryTable() {
+		self::dbg( __FUNCTION__ . ":" . __LINE__ );
+		$ki = self::intHash( '_expiry' );
+		if ( ! @shm_put_var( $this->shm, $ki, $this->expiryTable ) ) {
+			$oom = self::checkLastError( "not enough shared memory left" );
+			FiveCacheLogger::logMsg( "error writing expiry table (OOM=$oom), complete flush..." );
+			$this->shmClear(); // delete all data if we can't write expiry table
+
+			return false;
+		}
+		$this->expiryTableUpdated = false;
+
+		return true;
+	}
+
+
+	/* shm */
+
+	private function shmKey() {
+		return ftok( __FILE__, chr( 32 + ( $this->blog_id % 94 ) ) );
 	}
 
 	private function shmAttach() {
@@ -131,22 +487,44 @@ class WP_Object_Cache_Shm {
 		}
 	}
 
-	private function open() {
-		//self::dbg( __FUNCTION__ . ":" . __LINE__ );
-		$this->volatileCache = array();
-		$this->missingKeys   = array();
-		$this->writeBackKeys = array();
+	private function shmReadSafe( $ki, $gKey ) {
+		self::dbg( __FUNCTION__ . ":" . __LINE__ );
 
-		$this->shmAttach();
+		$value = @shm_get_var( $this->shm, $ki );
+		// TODO: sometimes returns NULL, needs investigation
+		if ( $value === false || is_null( $value ) ) {
+			/** @see https://github.com/php/php-src/blob/master/ext/sysvshm/sysvshm.c#L313 */
+			$shmCorrupt = self::checkLastError( "variable data in shared memory is corrupted" );
+			shm_remove_var( $this->shm, $ki );
+			// Warning: shm_get_var(): variable data in shared memory is corrupted ...
+			if ( $shmCorrupt ) {
+				FiveCacheLogger::logMsg( "error: memory corruption of $gKey!" );
+				$this->flush();
+			}
 
-		$this->readExpiryTable();
+			$vs = ( $value === false ) ? "FALSE" : "NULL";
+			FiveCacheLogger::logMsg( "error: $gKey reads $vs!" );
+
+			return false;
+		}
+
+		self::dbg( __FUNCTION__ . ":end" );
+		return $value;
 	}
 
-	// need to remap FALSE and NULL (shm_get_var can return both on corruption)
-	const FALSE = "__5cache_FALSE";
-	const NULL = "__5cache_NULL";
+	private function shmClear() { //return; // TODO disabled
+		$sh = $this->shm;
+		shm_remove( $this->shm );
+		shm_detach( $this->shm );
+		$this->shmAttach();
 
-	static function packFalse( $val ) {
+		FiveCacheLogger::logMsg( "shared memory $sh cleared!" );
+		if ( FIVECACHE_DRY_RUN ) {
+			FiveCacheLogger::logMsg( "Note that 5cache currently dry runs (FIVECACHE_DRY_RUN set)!" );
+		}
+	}
+
+	static function shmPack( $val ) {
 		if ( $val === false ) {
 			return self::FALSE;
 		}
@@ -157,7 +535,7 @@ class WP_Object_Cache_Shm {
 		return $val;
 	}
 
-	static function unpackFalse( $val ) {
+	static function shmUnpack( $val ) {
 		if ( is_string( $val ) ) {
 			if ( $val === self::FALSE ) {
 				return false;
@@ -168,73 +546,6 @@ class WP_Object_Cache_Shm {
 		}
 
 		return $val;
-	}
-
-	private $segvDetectorEntered = false;
-
-	const OOM = "not enough shared memory left";
-
-	public function segvDetectorEnter() {
-		$this->dbg( "segvDetectorEnter" );
-		if ( $this->segvDetectorEntered ) {
-			return true;
-		}
-
-		if(!$this->sem()) {
-			FiveCacheLogger::logMsg("error: segvDetectorEnter(): sem() failed!");
-			return false;
-		}
-
-		$gKey = "_5_seg_flag";
-		$ki   = self::intHash( $gKey );
-
-		if ( shm_has_var( $this->shm, $ki ) ) {
-			$tFlag  = $this->safeShmRead( $ki, $gKey );
-			$tSince = round( $_SERVER['REQUEST_TIME_FLOAT'] - $tFlag, 3 );
-			FiveCacheLogger::logMsg( "error: SEGV or unexpected shutdown $tSince s ago (req @$tFlag)!" );
-			$this->shmClear();
-		}
-
-
-		if ( ! @shm_put_var( $this->shm, $ki, $_SERVER['REQUEST_TIME_FLOAT'] ) ) {
-			$oom = self::checkLastError( self::OOM  );
-
-			FiveCacheLogger::logMsg( "error: setting $gKey (OOM=$oom), complete flush..." );
-			$this->shmClear();
-			if ( ! shm_put_var( $this->shm, $ki, $_SERVER['REQUEST_TIME_FLOAT'] ) ) {
-				FiveCacheLogger::logMsg( "critical error: setting $gKey even failed after flush!" );
-			} else {
-				$this->segvDetectorEntered = true;
-			}
-		} else {
-			$this->segvDetectorEntered = true;
-		}
-
-		return $this->segvDetectorEntered;
-	}
-
-	public function segvDetectorLeave() {
-		$this->dbg( "segvDetectorLeave" );
-		if ( ! $this->segvDetectorEntered ) {
-			FiveCacheLogger::logMsg( "warning: called segvDetectorLeave() but did not enter before!" );
-
-			return;
-		}
-
-		$gKey = "_5_seg_flag";
-		$ki   = self::intHash( $gKey );
-
-		if ( ! shm_remove_var( $this->shm, $ki ) ) {
-			FiveCacheLogger::logMsg( "error: removing $gKey failed!" );
-		} else {
-			$this->segvDetectorEntered = false;
-		}
-	}
-
-	private $semId = null;
-
-	private function shmKey() {
-		return ftok( __FILE__, chr( 32 + ( $this->blog_id % 94 ) ) );
 	}
 
 	private function sem() {
@@ -274,23 +585,194 @@ class WP_Object_Cache_Shm {
 		return $acquired;
 	}
 
-	private static function dbg( $msg ) {
-		//echo "$msg\n";
-		FiveCacheLogger::logMsg( $msg );
+
+	/* SEGV detector */
+
+	public function segvDetectorEnter() {
+		$this->dbg( "segvDetectorEnter" );
+		if ( $this->segvDetectorEntered ) {
+			return true;
+		}
+
+		if ( ! $this->sem() ) {
+			FiveCacheLogger::logMsg( "error: segvDetectorEnter(): sem() failed!" );
+
+			return false;
+		}
+
+		$gKey = "_5_seg_flag";
+		$ki   = self::intHash( $gKey );
+
+		if ( shm_has_var( $this->shm, $ki ) ) {
+			$tFlag  = $this->shmReadSafe( $ki, $gKey );
+			$tSince = round( $_SERVER['REQUEST_TIME_FLOAT'] - $tFlag, 3 );
+			FiveCacheLogger::logMsg( "error: SEGV or unexpected shutdown $tSince s ago (req @$tFlag)!" );
+			$this->shmClear();
+		}
+
+
+		if ( ! @shm_put_var( $this->shm, $ki, $_SERVER['REQUEST_TIME_FLOAT'] ) ) {
+			$oom = self::checkLastError( self::OOM );
+
+			FiveCacheLogger::logMsg( "error: setting $gKey (OOM=$oom), complete flush..." );
+			$this->shmClear();
+			if ( ! shm_put_var( $this->shm, $ki, $_SERVER['REQUEST_TIME_FLOAT'] ) ) {
+				FiveCacheLogger::logMsg( "critical error: setting $gKey even failed after flush!" );
+			} else {
+				$this->segvDetectorEntered = true;
+			}
+		} else {
+			$this->segvDetectorEntered = true;
+		}
+
+		return $this->segvDetectorEntered;
 	}
 
-	public function close() {
-		self::dbg( "close(), writing " . count( $this->writeBackKeys ) . " values, had $this->cache_hits hits and $this->cache_misses misses ... " );
-		//return false;
+	public function segvDetectorLeave() {
+		$this->dbg( "segvDetectorLeave" );
+		if ( ! $this->segvDetectorEntered ) {
+			FiveCacheLogger::logMsg( "warning: called segvDetectorLeave() but did not enter before!" );
 
-		if(!$this->shm )
+			return;
+		}
+
+		$gKey = "_5_seg_flag";
+		$ki   = self::intHash( $gKey );
+
+		if ( ! shm_remove_var( $this->shm, $ki ) ) {
+			FiveCacheLogger::logMsg( "error: removing $gKey failed!" );
+		} else {
+			$this->segvDetectorEntered = false;
+		}
+	}
+
+
+	/**
+	 * Generates a prefixed unique key across all groups
+	 *
+	 * @param $key
+	 * @param $group
+	 *
+	 * @return string the global key
+	 */
+	private function gKey( $key, &$group ) {
+		if ( empty( $group ) ) {
+			$group = 'default';
+		}
+
+		return "$group:$key";
+	}
+
+	private static function intHash( $str ) {
+		$key = unpack( 'q', hash( 'md4', $str, true ) );
+
+		return abs( $key[1] % PHP_INT_MAX );
+	}
+
+	public function getClock() {
+		return $this->clock;
+	}
+
+	/* Group Control */
+	public function add_global_groups( $groups ) {
+		if ( ! is_array( $groups ) ) {
+			$groups = (array) $groups;
+		}
+
+		$groups              = array_fill_keys( $groups, true );
+		$this->global_groups = array_merge( $this->global_groups, $groups );
+	}
+
+	public function add_non_persistent_groups( $groups ) {
+		if ( ! is_array( $groups ) ) {
+			$groups = (array) $groups;
+		}
+
+		$groups                      = array_fill_keys( $groups, true );
+		$this->non_persistent_groups = array_merge( $this->non_persistent_groups, $groups );
+	}
+
+
+
+	/* Misc WP_Cache access functions */
+
+	/**
+	 * Adds data to the cache, if the cache key doesn't already exist.
+	 *
+	 * @param int|string $key
+	 * @param mixed $data
+	 * @param string $group
+	 * @param int $expire Optional. Time span in seconds
+	 *
+	 * @return bool
+	 */
+	function add( $key, $data, $group = 'default', $expire = 0 ) {
+		if ( $this->_exist( $key, $group ) ) {
+			if ( ! FIVECACHE_DRY_RUN ) {
+				self::dbg( "warning: add() $group:$key exists (expire=$expire)!" );
+			}
+
 			return false;
+		}
 
-		$t = microtime( true ); // TODO debug
+		return $this->set( $key, $data, $group, $expire );
+	}
 
-		// because PHP shm is buggy, this function is quite dangerous
-		// it can cause the PHP process to SEGV !
-		// so we want to send all content to the peer, just in case
+	public function replace( $key, $data, $group = 'default', $expire = 0 ) {
+		if ( ! $this->_exist( $key, $group ) ) {
+			return false;
+		}
+
+		return $this->set( $key, $data, $group, $expire );
+	}
+
+	public function incr( $key, $n = 1, $group = 'default' ) {
+		$v = $this->get( $key, $group, false, $found );
+		if ( ! $found ) {
+			return false;
+		}
+		$v += $n;
+		$this->set( $key, (int) $v, $group );
+
+		return $v;
+	}
+
+	public function decr( $key, $n = 1, $group = 'default' ) {
+		return $this->incr( $key, - $n, $group );
+	}
+
+
+	/* Misc WP_Cache interface functions */
+
+	public function stats() {
+		echo "<p>";
+		echo "<strong>Cache Hits:</strong> {$this->cache_hits}<br />";
+		echo "<strong>Cache Misses:</strong> {$this->cache_misses}<br />";
+		echo "</p>";
+	}
+
+	public function switch_to_blog( $blog_id ) {
+		$newBlogId = $this->multisite ? ( 1 + (int) $blog_id ) : 0;
+
+		if ( $newBlogId == $this->blog_id ) {
+			return;
+		}
+
+		$this->close();
+		$this->blog_id = $newBlogId;
+		$this->open();
+	}
+
+
+	/* misc helper methods */
+
+	private static function checkLastError( $forMessage ) {
+		$err = error_get_last();
+
+		return ( $err && stripos( $err['message'], $forMessage ) !== false );
+	}
+
+	private static function sendAndClosePeerSession() {
 		ignore_user_abort( true );
 		$levels = ob_get_level();
 		for ( $i = 0; $i < $levels; $i ++ ) {
@@ -298,99 +780,42 @@ class WP_Object_Cache_Shm {
 		}
 		flush();
 		session_write_close();
+	}
 
-		// in case of write failed, keep track of keys written after the flush
-		$writtenAfterFlush = array();
-		$flushed           = false;
+	private static function dbg( $msg ) {
+		FiveCacheLogger::logMsg( $msg );
+	}
+}
 
-		// lazy write back before close
-		$writeOk = true;
-		foreach ( $this->writeBackKeys as $gKey => $expire ) {
-			//self::dbg( "close(), writing $gKey, expire=$expire ... " );
+class FiveCachePrimer {
 
-			$ki   = self::intHash( $gKey );
-			$data = self::packFalse( $this->volatileCache[ $gKey ] );
+	/** @var  WP_Object_Cache_Shm */
+	private $cache;
 
-			// shm_put_var can cause SEGV and an instant PHP process kill
-			if ( ! $this->sem() ) {
-				// without a safe sem access we should not write!
-				FiveCacheLogger::logMsg( "error: sem() failed while writing $gKey, will drop all volatile data!" );
-				shm_detach( $this->shm );
+	private $primeCallbacks = array();
+	private $primeRequest;
 
-				return false;
-			}
+	function __construct( $cache ) {
+		$this->primeRequest = isset( $_GET['5cache-prime'] );
 
-			$this->segvDetectorEnter();
+		if ( $this->primeRequest ) {
+			$this->handlePrime();
+		} else {
+			register_shutdown_function( function () {
+				$this->maybeSpawnPrimers();
+			} );
+		};
+	}
 
-			/** @see https://github.com/php/php-src/blob/master/ext/sysvshm/sysvshm.c#L246 */
-			if ( ! @shm_put_var( $this->shm, $ki, $data ) ) {
-				$oom = self::checkLastError( "not enough shared memory left" );
-				self::dbg( __FUNCTION__ . ":" . __LINE__ . "shm_put_var fail! (oom=$oom)" );
-				FiveCacheLogger::logMsg( "error: put $gKey failed (OOM=$oom), complete flush..." );
-				$this->shmClear(); // delete all other keys, sorry :/
-				$writtenAfterFlush = array();
-				$flushed           = true;
-
-				if ( ! shm_put_var( $this->shm, $ki, $data ) ) {
-					$writeOk = false;
-					continue; // don't add to $writtenAfterFlush
-				}
-			}
-
-			if ( $flushed ) {
-				$writtenAfterFlush[ $ki ] = 1;
-			}
+	public function enableDeferOptimization() {
+		if ( ! $this->primeRequest && function_exists( 'add_action' ) ) {
+			$this->disableSlowHooks();
 		}
-		self::dbg( __FUNCTION__ . ":" . __LINE__ );
-
-		// if flushed during above loop, update expiry table
-		// only keep keys written after the flush
-		if ( $flushed ) {
-			self::dbg( __FUNCTION__ . ":" . __LINE__ );
-			$this->expiryTable        = array_intersect_key( $this->expiryTable, $writtenAfterFlush );
-			$this->expiryTableUpdated = true;
-		}
-
-		if ( $this->expiryTableUpdated ) {
-			$this->segvDetectorEnter();
-			if ( ! $this->sem() ) {
-				// this should never happen, because any change to the expiry table requires a write
-				// and we already sem() above // TODO remove
-				FiveCacheLogger::logMsg( "error: sem() failed while writing expiry table, will drop all volatile data!" );
-				shm_detach( $this->shm );
-
-				return false;
-			}
-			$writeOk &= $this->writeExpiryTable();
-		}
-
-
-		if ( ! $writeOk ) {
-			FiveCacheLogger::logMsg( "close(): error writing shm!" );
-		}
-
-		$this->writeBackKeys = array();
-
-		$this->segvDetectorLeave();
-		$ok        = shm_detach( $this->shm );
-		$this->shm = null;
-
-		if ( $this->semId ) {
-			self::dbg( "close(): sem release" );
-			// release the semaphore by deleting any reference
-			$this->semId = null;
-		}
-
-
-		$t = round( ( microtime( true ) - $t ) * 1e3 );
-		self::dbg( "close function took $t ms" );
-
-		return $ok;
 	}
 
 	private function maybeSpawnPrimers() {
 		if ( function_exists( 'get_current_screen' ) && ( $screen = get_current_screen() ) ) {
-			$lastPrimeTimes = $this->get( 'lastPrimeTimes', '5cache' );
+			$lastPrimeTimes = $this->cache->get( 'lastPrimeTimes', '5cache' );
 			$spawned        = false;
 			foreach ( self::bgPrimers() as $gKey => $primer ) {
 				$interval = INF;
@@ -403,18 +828,18 @@ class WP_Object_Cache_Shm {
 					}
 				}
 
-				if ( $interval === INF || ( isset( $lastPrimeTimes[ $gKey ] ) && ( $this->clock - $lastPrimeTimes[ $gKey ] ) < $interval ) ) {
+				if ( $interval === INF || ( isset( $lastPrimeTimes[ $gKey ] ) && ( $this->cache->getClock() - $lastPrimeTimes[ $gKey ] ) < $interval ) ) {
 					continue;
 				}
 
 				self::spawnPrime( $gKey );
 
-				$lastPrimeTimes[ $gKey ] = $this->clock;
+				$lastPrimeTimes[ $gKey ] = $this->cache->getClock();
 				$spawned                 = true;
 			}
 
 			if ( $spawned ) {
-				$this->set( 'lastPrimeTimes', $lastPrimeTimes, '5cache' );
+				$this->cache->set( 'lastPrimeTimes', $lastPrimeTimes, '5cache' );
 			}
 		}
 	}
@@ -428,21 +853,19 @@ class WP_Object_Cache_Shm {
 		ignore_user_abort( true );
 
 		add_action( 'plugins_loaded', function () {
-			if ( ! function_exists( 'wp_verify_nonce' ) ) {
-				/** @noinspection PhpIncludeInspection */
-				require_once( ABSPATH . WPINC . '/pluggable.php' );
-			}
-			$this->doingPrime = isset( $_GET['5n'] ) && wp_verify_nonce( $_GET['5n'], "5cache-prime=" . $_GET['5cache-prime'] );
-			if ( ! $this->doingPrime ) {
-				wp_die( 'invalid prime ' . $_GET['5n'] . ' ' . "5cache-prime=" . $_GET['5cache-prime'] );
+			$valid = isset( $_GET['5n'] ) && wp_verify_nonce( $_GET['5n'], "5cache-prime=" . $_GET['5cache-prime'] );
+			if ( ! $valid ) {
+				FiveCacheLogger::logMsg( "warning: invalid prime request" );
+				wp_die( 'invalid prime request ' );
 				exit;
 			}
 			register_shutdown_function( function () {
 				$this->doPrime( $_GET['5cache-prime'] );
 			} );
 		} );
-	}
 
+		return true;
+	}
 
 	/**
 	 * Primes a specific cache value
@@ -451,7 +874,9 @@ class WP_Object_Cache_Shm {
 	 *
 	 */
 	private function doPrime( $gKey ) {
-		$this->housekeeping();
+		foreach ( $this->primeCallbacks as $callback ) {
+			call_user_func( $callback );
+		}
 
 		$primers = self::bgPrimers();
 
@@ -511,428 +936,33 @@ class WP_Object_Cache_Shm {
 		);
 	}
 
-	/**
-	 * Delete expired data from shared memory. Does not touch volatile cache layer
-	 */
-	private function housekeeping() {
-		foreach ( $this->expiryTable as $ki => $expireAt ) {
-			if ( $expireAt > $this->clock && shm_has_var( $this->shm, $ki ) ) {
-				shm_remove_var( $this->shm, $ki );
-				unset( $this->expiryTable [ $ki ] );
-				$this->expiryTableUpdated = true;
+	private function disableSlowHooks() {
+		add_action( 'plugins_loaded', function () {
+			if ( is_admin() ) {
+				remove_action( 'load-plugins.php', 'wp_update_plugins' );
+				remove_action( 'load-update-core.php', 'wp_update_plugins' );
+				remove_action( 'load-update-core.php', 'wp_update_themes' );
+				//remove_action( 'admin_init', '_maybe_update_plugins' );
+				//remove_action( 'admin_init', '_maybe_update_themes' );
+				//remove_action( 'admin_init', '_maybe_update_core' );
 			}
-		}
-	}
+			remove_action( 'init', 'wp_cron' ); // TODO if removed -> start primer
+		} );
 
-	/**
-	 * @param string $key
-	 * @param mixed $data
-	 * @param string $group
-	 * @param int $expire
-	 *
-	 * @return bool
-	 */
-	public function set( $key, $data, $group = 'default', $expire = 0 ) {
-		if ( $this->shm === null ) {
-			FiveCacheLogger::logMsg( "error: set() after close $key group=$group, ignoring!" );
-
-			return false;
-		}
-
-		self::dbg( "set(): $key, group=$group, expire=$expire, len=" . strlen( serialize( $data ) ) );
-		$gKey = $this->gKey( $key, $group );
-
-		if ( is_object( $data ) ) {
-			$data = clone $data;
-		}
-
-		$this->volatileCache[ $gKey ] = $data;
-		$this->writeBackKeys[ $gKey ] = $expire;
-		unset( $this->missingKeys[ $gKey ] );
-
-
-		// if no expiry is set is in a non persistent group, set expire to a fixed value (5min)
-		if ( $expire <= 0 ) {
-			if ( isset( $this->non_persistent_groups[ $group ] ) ) {
-				$expire = 300;
+		// suppress ANY shutdown actions (JetPack does a sync)
+		add_action( 'wp_loaded', function () {
+			global $wp_filter;
+			if ( isset( $wp_filter['shutdown'] ) && count( $wp_filter['shutdown']->callbacks ) > 0 ) {
+				$wp_filter['shutdown']->callbacks = [];
+				// TODO start primer
 			}
-		}
-
-		// update expiryTable
-		$ki = self::intHash( $gKey );
-		if ( $expire > 0 ) {
-			$this->expiryTable[ $ki ] = $this->clock + $expire + self::EXPIRE_DELAY;
-			$this->expiryTableUpdated = true;
-		} elseif ( isset( $this->expiryTable[ $ki ] ) ) {
-			unset( $this->expiryTable[ $ki ] );
-			$this->expiryTableUpdated = true;
-		}
-
-		return true;
+		}, 1e9 );
 	}
 
-
-	/**
-	 * @param $key
-	 * @param string $group
-	 * @param bool $force_unused
-	 * @param null $found
-	 *
-	 * @return bool|mixed
-	 */
-	public function get(
-		$key, $group = 'default', /** @noinspection PhpUnusedParameterInspection */
-		$force_unused = false, &$found = null
-	) {
-		//$found = false;
-		//return false;
-
-		//self::dbg( __FUNCTION__ . ":" . __LINE__  );
-		$gKey = $this->gKey( $key, $group );
-
-		if ( isset( $this->volatileCache[ $gKey ] ) ) {
-			$found = true;
-			++ $this->cache_hits;
-
-			if ( is_object( $this->volatileCache[ $gKey ] ) ) {
-				return clone $this->volatileCache[ $gKey ];
-			} else {
-				return $this->volatileCache[ $gKey ];
-			}
-		}
-
-		if ( isset( $this->missingKeys[ $gKey ] ) ) {
-			$found = false;
-			++ $this->cache_misses;
-
-			return false;
-		}
-
-		$ki = self::intHash( $gKey );
-
-		// check expiry
-		if ( isset( $this->expiryTable[ $ki ] ) && $this->expiryTable[ $ki ] < $this->clock ) {
-			$this->missingKeys[ $gKey ] = true;
-			unset( $this->volatileCache[ $gKey ], $this->expiryTable[ $ki ] );
-			$found = false;
-			++ $this->cache_misses;
-
-			return false;
-		}
-
-
-		self::dbg("get(): shm_has_var"  );
-
-
-		$found = shm_has_var( $this->shm, $ki );
-		if ( ! $found ) {
-			$this->missingKeys[ $gKey ] = 1;
-			++ $this->cache_misses;
-
-			return false;
-		}
-
-		self::dbg("get(): safeShmRead"  );
-
-		$value = $this->safeShmRead( $ki, $gKey );
-
-		if ( $value === false ) {
-			// error during read
-			$this->missingKeys[ $gKey ] = 1;
-			unset( $this->volatileCache[ $gKey ], $this->expiryTable[ $ki ] );
-			++ $this->cache_misses;
-			$found = false;
-
-			return false;
-		}
-
-		++ $this->cache_hits;
-
-		//$this->volatileCache[ $gKey ] = $value;
-
-		return ( $this->volatileCache[ $gKey ] = self::unpackFalse( $value ) );
-	}
-
-	private static function checkLastError( $forMessage ) {
-		$err = error_get_last();
-
-		return ( $err && stripos( $err['message'], $forMessage ) !== false );
-	}
-
-	private function safeShmRead( $ki, $gKey ) {
-		//self::dbg( __FUNCTION__ . ":" . __LINE__ );
-
-		$value = @shm_get_var( $this->shm, $ki );
-		// TODO: sometimes returns NULL, needs investigation
-		if ( $value === false || is_null( $value ) ) {
-			/** @see https://github.com/php/php-src/blob/master/ext/sysvshm/sysvshm.c#L313 */
-			$shmCorrupt = self::checkLastError( "variable data in shared memory is corrupted" );
-			shm_remove_var( $this->shm, $ki );
-			// Warning: shm_get_var(): variable data in shared memory is corrupted ...
-			if ( $shmCorrupt ) {
-				FiveCacheLogger::logMsg( "error: memory corruption of $gKey!" );
-				$this->flush();
-			}
-
-			$vs = ( $value === false ) ? "FALSE" : "NULL";
-			FiveCacheLogger::logMsg( "error: $gKey reads $vs!" );
-
-			return false;
-		}
-
-		return $value;
-	}
-
-	private function readExpiryTable() {
-		self::dbg( __FUNCTION__ . ":" . __LINE__ );
-		$ki = self::intHash( '_expiry' );
-		if ( ! shm_has_var( $this->shm, $ki ) ) {
-			return;
-		}
-		$res = $this->safeShmRead( $ki, '_expiry' );
-		if ( ! is_array( $res ) ) {
-			FiveCacheLogger::logMsg( "error reading expiry table, complete flush..." );
-			$this->flush();
-
-			return;
-		}
-		$this->expiryTable        = $res;
-		$this->expiryTableUpdated = false;
-	}
-
-	private function writeExpiryTable() {
-		self::dbg( __FUNCTION__ . ":" . __LINE__ );
-		$ki = self::intHash( '_expiry' );
-		if ( ! @shm_put_var( $this->shm, $ki, $this->expiryTable ) ) {
-			$oom = self::checkLastError( "not enough shared memory left" );
-			FiveCacheLogger::logMsg( "error writing expiry table (OOM=$oom), complete flush..." );
-			$this->shmClear(); // delete all data if we can't write expiry table
-
-			return false;
-		}
-		$this->expiryTableUpdated = false;
-
-		return true;
-	}
-
-
-	public function _delete(
-		$key, $group = 'default', /** @noinspection PhpUnusedParameterInspection */
-		$deprecated = false
-	) {
-		//return true;
-		$gKey = $this->gKey( $key, $group );
-
-		self::dbg( "_delete(): $gKey" );
-
-		$ok = isset( $this->volatileCache[ $gKey ] );
-
-		unset( $this->volatileCache[ $gKey ], $this->writeBackKeys[ $gKey ] );
-		$this->missingKeys[ $gKey ] = 1;
-
-		$ki = self::intHash( $gKey );
-		if ( ! shm_has_var( $this->shm, $ki ) ) {
-			FiveCacheLogger::logMsg( "delete($gKey), but not found in shm (shm_has_var), found in volatile='$ok'" );
-
-			return $ok;
-		}
-
-		unset( $this->expiryTable[ $ki ] );
-		$this->expiryTableUpdated = true;
-
-		self::dbg( "_delete(): $gKey shm_remove_var ..." );
-		if ( ! shm_remove_var( $this->shm, $ki ) ) {
-			FiveCacheLogger::logMsg( "error: delete($gKey), supposed to be in shm, but shm_remove_var returned false, volatile='$ok'" );
-
-			return $ok;
-		}
-
-		return true;
-	}
-
-
-	/**
-	 * Generates a prefixed unique key across all groups
-	 *
-	 * @param $key
-	 * @param $group
-	 *
-	 * @return string the global key
-	 */
-	private function gKey( $key, &$group ) {
-		if ( empty( $group ) ) {
-			$group = 'default';
-		}
-
-		return "$group:$key";
-	}
-
-	private static function intHash( $str ) {
-		$key = unpack( 'q', hash( 'md4', $str, true ) );
-
-		return abs( $key[1] % PHP_INT_MAX );
-	}
-
-
-	/**
-	 * Adds data to the cache, if the cache key doesn't already exist.
-	 *
-	 * @since 2.0.0
-	 *
-	 * @see WP_Object_Cache::add()
-	 * @global WP_Object_Cache $wp_object_cache Object cache global instance.
-	 *
-	 * @param int|string $key The cache key to use for retrieval later.
-	 * @param mixed $data The data to add to the cache.
-	 * @param string $group Optional. The group to add the cache to. Enables the same key
-	 *                           to be used across groups. Default empty.
-	 * @param int $expire Optional. When the cache data should expire, in seconds.
-	 *                           Default 0 (no expiration).
-	 *
-	 * @return bool False if cache key and group already exist, true on success.
-	 */
-	function add( $key, $data, $group = 'default', $expire = 0 ) {
-		if ( $this->_exist( $key, $group ) ) {
-			if ( ! FIVECACHE_DRY_RUN ) {
-				self::dbg( "warning: add() $group:$key exists (expire=$expire)!" );
-			}
-
-			return false;
-		}
-
-		return $this->set( $key, $data, $group, $expire );
-	}
-
-
-	public function add_global_groups( $groups ) {
-		if ( ! is_array( $groups ) ) {
-			$groups = (array) $groups;
-		}
-
-		$groups              = array_fill_keys( $groups, true );
-		$this->global_groups = array_merge( $this->global_groups, $groups );
-	}
-
-	public function add_non_persistent_groups( $groups ) {
-		if ( ! is_array( $groups ) ) {
-			$groups = (array) $groups;
-		}
-
-		$groups                      = array_fill_keys( $groups, true );
-		$this->non_persistent_groups = array_merge( $this->non_persistent_groups, $groups );
-	}
-
-	public function decr( $key, $n = 1, $group = 'default' ) {
-		return $this->incr( $key, - $n, $group );
-	}
-
-
-	/**
-	 * Clears the object cache of all data.
-	 *
-	 * @since 2.0.0
-	 * @access public
-	 *
-	 * @return true Always returns true.
-	 */
-	public function flush() {
-		self::dbg( __FUNCTION__ . ":" . __LINE__ );
-		// log sth before the actual flush to retrieve the logDir from cache!
-		FiveCacheLogger::logMsg( "flushing ... ", true );
-
-		$this->volatileCache      = array();
-		$this->writeBackKeys      = array();
-		$this->expiryTable        = array();
-		$this->expiryTableUpdated = false;
-
-		$this->shmClear();
-
-		FiveCacheLogger::logMsg( "cache flushed! " . json_encode( debug_backtrace( DEBUG_BACKTRACE_IGNORE_ARGS ) ) );
-
-		return true;
-	}
-
-	private function shmClear() {
-		$sh = $this->shm;
-		shm_remove( $this->shm );
-		shm_detach( $this->shm );
-		$this->shmAttach();
-
-		FiveCacheLogger::logMsg( "shared memory $sh cleared!" );
-		if ( FIVECACHE_DRY_RUN ) {
-			FiveCacheLogger::logMsg( "Note that 5cache currently dry runs (FIVECACHE_DRY_RUN set)!" );
-		}
-	}
-
-
-	private function _exist( $key, $group ) {
-		$gKey = $this->gKey( $key, $group );
-
-		if ( isset( $this->volatileCache[ $gKey ] ) ) {
-			return true;
-		}
-
-		if ( isset( $this->missingKeys[ $gKey ] ) ) {
-			return false;
-		}
-
-		$ki = self::intHash( $gKey );
-		if ( isset( $this->expiryTable[ $ki ] ) && $this->expiryTable[ $ki ] < $this->clock ) {
-			$this->missingKeys[ $gKey ] = true;
-			unset( $this->volatileCache[ $gKey ], $this->expiryTable[ $ki ] );
-
-			return false;
-		}
-
-		if ( shm_has_var( $this->shm, $ki ) ) {
-			return true;
-		} else {
-			$this->missingKeys[ $gKey ] = true;
-
-			return false;
-		}
-	}
-
-	public function incr( $key, $n = 1, $group = 'default' ) {
-		$v = $this->get( $key, $group, false, $found );
-		if ( ! $found ) {
-			return false;
-		}
-		$v += $n;
-		$this->set( $key, (int) $v, $group );
-
-		return $v;
-	}
-
-	public function replace( $key, $data, $group = 'default', $expire = 0 ) {
-		if ( ! $this->_exist( $key, $group ) ) {
-			return false;
-		}
-
-		return $this->set( $key, $data, $group, $expire );
-	}
-
-
-	public function stats() {
-		echo "<p>";
-		echo "<strong>Cache Hits:</strong> {$this->cache_hits}<br />";
-		echo "<strong>Cache Misses:</strong> {$this->cache_misses}<br />";
-		echo "</p>";
-	}
-
-	public function switch_to_blog( $blog_id ) {
-		$newBlogId = $this->multisite ? ( 1 + (int) $blog_id ) : 0;
-
-		if ( $newBlogId == $this->blog_id ) {
-			return;
-		}
-
-		$this->close();
-		$this->blog_id = $newBlogId;
-		$this->open();
+	public function onPrime( callable $callback ) {
+		$this->primeCallbacks[] = $callback;
 	}
 }
-
 
 class FiveCacheLogger {
 	private static function getSecret( $salt ) {
@@ -986,6 +1016,7 @@ class FiveCacheLogger {
 		$logFile && @error_log( $msg, 3, $logFile );
 		@error_log( $msg ); // pass to default PHP log file too
 	}
+
 }
 
 function wp_cache_add( $key, $data, $group = '', $expire = 0 ) {
@@ -1015,7 +1046,7 @@ function wp_cache_close() {
 function wp_cache_delete( $key, $group = '' ) {
 	global $wp_object_cache;
 
-	return $wp_object_cache->_delete( $key, $group );
+	return $wp_object_cache->delete( $key, $group );
 }
 
 function wp_cache_flush() {
@@ -1092,8 +1123,10 @@ function wp_cache_set( $key, $data, $group = '', $expire = 0 ) {
 
 			return $result;
 		}
+
 		return $result;
 	}
+
 	return $wp_object_cache->set( $key, $data, $group, (int) $expire );
 }
 
